@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布 tag，例如 v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    name: Build macOS universal bundle
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Verify tag matches version files
+        run: |
+          bash scripts/check-version.sh "${RELEASE_TAG}"
+
+      - run: npm ci
+
+      - name: Check updater signing secret
+        env:
+          TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_KEY" ]; then
+            echo "缺少 TAURI_SIGNING_PRIVATE_KEY，无法生成自动更新签名" >&2
+            echo "在仓库 Secrets 中配置私钥后再发布" >&2
+            exit 1
+          fi
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: "Costline v__VERSION__"
+          releaseBody: |
+            下载下方对应安装包。已安装旧版本的用户会在下次启动时收到自动更新提示。
+
+            更新包由 Tauri updater 签名，应用内会自动校验签名后安装。
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.release.conf.json
+
+  release-notes:
+    name: Apply curated release notes
+    needs: release
+    if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply release-notes/<tag>.md
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          notes="release-notes/${TAG}.md"
+          if [ ! -f "$notes" ]; then
+            echo "::notice::未找到 $notes，保留 tauri-action 生成的默认 release body。"
+            echo "运行 make notes 生成后提交，再执行 gh release edit $TAG --notes-file $notes"
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release edit "$TAG" --notes-file "$notes"; then
+              echo "Release notes applied: $notes"
+              exit 0
+            fi
+            echo "Release 尚未就绪（第 $attempt 次），5 秒后重试..."
+            sleep 5
+          done
+          echo "::error::无法写入 Release notes，请手动执行 gh release edit $TAG --notes-file $notes"
+          exit 1

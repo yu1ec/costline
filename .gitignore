@@ -1,0 +1,15 @@
+/target
+/dist
+/node_modules
+/src-tauri/gen
+/src-tauri/*.key
+/src-tauri/*.key.pub
+*.key
+*.key.pub
+/.env
+/.env.*
+!/.env.example
+/costline.toml
+/state.json
+*.state.json
+.DS_Store
