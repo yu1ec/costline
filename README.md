@@ -216,7 +216,7 @@ scripts/release-notes.sh 0.2.0 --dry-run   # 只打印，不写文件
 
 ### CI
 
-`.github/workflows/ci.yml` 在 push / PR 时执行：
+`.github/workflows/ci.yml` 在 pull request 时执行（master 直接 push 不会触发）：
 
 - 前端：`npm ci && npm run build`
 - Rust：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`
