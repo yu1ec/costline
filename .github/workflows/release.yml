@@ -25,10 +25,13 @@ jobs:
   release:
     name: Build macOS universal bundle
     runs-on: macos-15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: actions/setup-node@v4
         with:
@@ -59,10 +62,33 @@ jobs:
             exit 1
           fi
 
-      - name: Build and publish release
-        uses: tauri-apps/tauri-action@v0
+      # GITHUB_TOKEN 无法在 target commit 相对默认分支改过 .github/workflows/ 时
+      # 调用 create-a-release。先用已有 tag 建空 Release，tauri-action 只负责上传产物。
+      - name: Ensure GitHub Release exists
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
+            exit 0
+          fi
+          notes="release-notes/${RELEASE_TAG}.md"
+          extra=()
+          if [ -f "$notes" ]; then
+            extra+=(--notes-file "$notes")
+          else
+            extra+=(--notes "下载下方对应安装包。已安装旧版本的用户会在下次启动时收到自动更新提示。")
+          fi
+          gh release create "$RELEASE_TAG" \
+            --title "Costline ${RELEASE_TAG#v}" \
+            --verify-tag \
+            "${extra[@]}"
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
@@ -74,7 +100,7 @@ jobs:
             更新包由 Tauri updater 签名，应用内会自动校验签名后安装。
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
+          uploadUpdaterJson: true
           args: --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.release.conf.json
 
   release-notes:
@@ -86,11 +112,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Apply release-notes/<tag>.md
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           set -euo pipefail
