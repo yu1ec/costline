@@ -1,15 +1,28 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { RefreshCw, Search } from "lucide-react";
 import type { AssetDraft } from "../drafts";
 import {
   ASSET_KINDS,
+  WEEKDAY_LABELS,
   assetDerivedCost,
   assetDerivedTarget,
   assetDraftError,
   assetPrimaryCode,
+  kindLabel,
+  sipScheduleLabel,
 } from "../drafts";
+import { api } from "../api";
 import { formatPrice } from "../format";
-import type { AssetKind } from "../types";
-import { Field, Modal, NumberField, Segmented, TextInput } from "./ui";
+import type { AssetKind, AssetSearchItem, SipFrequency } from "../types";
+import {
+  Field,
+  Modal,
+  NumberField,
+  Segmented,
+  Select,
+  Tag,
+  TextInput,
+} from "./ui";
 
 export function AssetModal({
   initial,
@@ -21,14 +34,73 @@ export function AssetModal({
   initial: AssetDraft;
   index: number | null;
   globalThreshold: number;
-  onSave: (draft: AssetDraft) => void;
+  onSave: (draft: AssetDraft) => void | Promise<void>;
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState<AssetDraft>({ ...initial });
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<AssetSearchItem[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  useEffect(() => {
+    const keyword = query.trim();
+    if (!keyword) {
+      setResults([]);
+      setSearchError(null);
+      setSearching(false);
+      setSearchOpen(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setSearching(true);
+      setSearchError(null);
+      api
+        .searchAssets(keyword)
+        .then((items) => {
+          if (cancelled) return;
+          setResults(items);
+          setSearchOpen(true);
+        })
+        .catch((reason: unknown) => {
+          if (cancelled) return;
+          setResults([]);
+          setSearchError(errorMessage(reason));
+          setSearchOpen(true);
+        })
+        .finally(() => {
+          if (!cancelled) setSearching(false);
+        });
+    }, 400);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [query]);
 
   function set<K extends keyof AssetDraft>(key: K, value: AssetDraft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
+  }
+
+  function pick(item: AssetSearchItem) {
+    setDraft((current) => ({
+      ...current,
+      kind: item.kind,
+      name: item.name,
+      symbol: item.kind === "fund" ? "" : item.symbol || item.code,
+      code: item.kind === "fund" ? item.code || item.symbol || "" : "",
+      secid: item.secid ?? "",
+    }));
+    setQuery(item.name);
+    setResults([]);
+    setSearchOpen(false);
+    setError(null);
   }
 
   function changeKind(kind: AssetKind) {
@@ -41,13 +113,31 @@ export function AssetModal({
     }));
   }
 
-  function submit() {
+  function changeSipFrequency(frequency: SipFrequency) {
+    setDraft((current) => ({
+      ...current,
+      sipFrequency: frequency,
+      // 每周用 1-7，切换过去时如果原来的日期超出范围就重置为周一。
+      sipDay:
+        frequency === "weekly" &&
+        !["1", "2", "3", "4", "5", "6", "7"].includes(current.sipDay.trim())
+          ? "1"
+          : current.sipDay,
+    }));
+  }
+
+  async function submit() {
     const problem = assetDraftError(draft);
     if (problem) {
       setError(problem);
       return;
     }
-    onSave(draft);
+    setSubmitting(true);
+    try {
+      await onSave(draft);
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   const cost = assetDerivedCost(draft);
@@ -71,8 +161,13 @@ export function AssetModal({
           <button type="button" className="btn ghost" onClick={onClose}>
             取消
           </button>
-          <button type="button" className="btn primary" onClick={submit}>
-            {index == null ? "添加" : "保存"}
+          <button
+            type="button"
+            className="btn primary"
+            onClick={submit}
+            disabled={submitting}
+          >
+            {submitting ? "保存中…" : index == null ? "添加" : "保存"}
           </button>
         </>
       }
@@ -85,6 +180,72 @@ export function AssetModal({
             onChange={changeKind}
           />
         </Field>
+
+        <div className="field">
+          <span className="field-label">搜索资产</span>
+          <div className="asset-search">
+            <Search size={15} className="asset-search-icon" />
+            <input
+              className="input asset-search-field"
+              value={query}
+              placeholder="例如：浦发银行 / 600000 / 161725 / AU9999"
+              onChange={(event) => {
+                setQuery(event.target.value);
+                setSearchOpen(true);
+              }}
+              onFocus={() => {
+                if (results.length > 0 || searchError) setSearchOpen(true);
+              }}
+              onBlur={() => window.setTimeout(() => setSearchOpen(false), 120)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  setSearchOpen(false);
+                } else if (event.key === "Enter" && results.length > 0) {
+                  event.preventDefault();
+                  pick(results[0]);
+                }
+              }}
+            />
+            {searching ? (
+              <RefreshCw size={14} className="asset-search-spinner spin" />
+            ) : null}
+            {searchOpen && query.trim() ? (
+              <div className="asset-search-menu">
+                {searchError ? (
+                  <div className="asset-search-empty error">{searchError}</div>
+                ) : results.length === 0 ? (
+                  <div className="asset-search-empty">
+                    {searching ? "搜索中…" : "没有找到匹配的股票、基金或黄金"}
+                  </div>
+                ) : (
+                  results.map((item, position) => (
+                    <button
+                      type="button"
+                      key={`${item.kind}-${item.secid ?? item.code}-${position}`}
+                      className="asset-search-item"
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        pick(item);
+                      }}
+                    >
+                      <span className="asset-search-name">
+                        <strong>{item.name}</strong>
+                        <span>
+                          {item.code}
+                          {item.market ? ` · ${item.market}` : ""}
+                        </span>
+                      </span>
+                      <Tag>{kindLabel(item.kind)}</Tag>
+                    </button>
+                  ))
+                )}
+              </div>
+            ) : null}
+          </div>
+          <span className="field-hint">
+            输入名称或代码，选中结果会自动填入类型、名称和代码
+          </span>
+        </div>
 
         <div className="form-grid two">
           <Field label="名称" hint="留空时使用行情接口返回的名称">
@@ -159,6 +320,87 @@ export function AssetModal({
           </Field>
         </div>
 
+        <div className="sip-block">
+          <label className="sip-toggle">
+            <input
+              type="checkbox"
+              checked={draft.sipEnabled}
+              onChange={(event) => set("sipEnabled", event.target.checked)}
+            />
+            <span>
+              <strong>定投提醒</strong>
+              <em>
+                股票、基金、黄金都支持；到定投日会通过通知渠道提醒你，不会自动下单
+              </em>
+            </span>
+          </label>
+
+          {draft.sipEnabled ? (
+            <div className="form-grid two sip-fields">
+              <Field label="每期金额" hint="按当前价估算可买数量">
+                <NumberField
+                  value={draft.sipAmount}
+                  placeholder="500"
+                  onChange={(value) => set("sipAmount", value)}
+                />
+              </Field>
+              <Field label="周期">
+                <Segmented
+                  value={draft.sipFrequency}
+                  options={[
+                    { value: "monthly", label: "每月" },
+                    { value: "weekly", label: "每周" },
+                  ]}
+                  onChange={changeSipFrequency}
+                />
+              </Field>
+              <Field
+                label={draft.sipFrequency === "weekly" ? "星期" : "每月几号"}
+                hint={
+                  draft.sipFrequency === "monthly"
+                    ? "超过当月天数时按当月最后一天"
+                    : undefined
+                }
+              >
+                {draft.sipFrequency === "weekly" ? (
+                  <Select
+                    value={draft.sipDay}
+                    onChange={(event) => set("sipDay", event.target.value)}
+                  >
+                    {WEEKDAY_LABELS.map((label, index) => (
+                      <option key={label} value={String(index + 1)}>
+                        {label}
+                      </option>
+                    ))}
+                  </Select>
+                ) : (
+                  <NumberField
+                    value={draft.sipDay}
+                    placeholder="1"
+                    onChange={(value) => set("sipDay", value)}
+                  />
+                )}
+              </Field>
+              <Field label="提醒时间" hint="到点后的下一轮检查会提醒">
+                <TextInput
+                  type="time"
+                  value={draft.sipTime}
+                  onChange={(event) => set("sipTime", event.target.value)}
+                />
+              </Field>
+            </div>
+          ) : null}
+
+          {draft.sipEnabled ? (
+            <div className="sip-summary">
+              定投计划：{sipScheduleLabel(draft)}
+              {draft.sipAmount.trim()
+                ? ` · 每期 ${formatPrice(Number(draft.sipAmount) || 0)}`
+                : ""}
+            </div>
+          ) : null}
+        </div>
+
         {cost != null || target != null ? (
           <div className="derive-box">
             <span>成本价</span>
@@ -172,4 +414,10 @@ export function AssetModal({
       </div>
     </Modal>
   );
+}
+
+function errorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  return String(error);
 }

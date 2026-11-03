@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::{DateTime, Duration as ChronoDuration, Local};
 use reqwest::Client;
 use serde::Serialize;
 
@@ -10,6 +10,18 @@ use crate::config::Config;
 use crate::market;
 use crate::notify::{self, Notice};
 use crate::state::State;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SipInfo {
+    pub enabled: bool,
+    pub amount: f64,
+    /// 例如「每月 1 日 09:30」
+    pub schedule: String,
+    /// 下一次定投时间，例如 2026-12-01 09:30
+    pub next_at: Option<String>,
+    /// 今天是否是定投日（且已到提醒时间）
+    pub due_today: bool,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Row {
@@ -26,6 +38,23 @@ pub struct Row {
     pub above: bool,
     pub triggered: bool,
     pub note: String,
+    pub sip: Option<SipInfo>,
+}
+
+/// 本轮到期的定投提醒。
+#[derive(Debug, Clone, Serialize)]
+pub struct SipReminder {
+    pub key: String,
+    pub name: String,
+    pub kind: &'static str,
+    pub id: String,
+    pub amount: f64,
+    pub currency: String,
+    pub price: Option<f64>,
+    /// 按当前价估算的可买数量
+    pub estimate_quantity: Option<f64>,
+    pub schedule: String,
+    pub next_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +77,12 @@ pub struct CheckReport {
     pub notify_results: Vec<ChannelResult>,
     /// 有触发但未发送通知时的原因
     pub notify_skipped: Option<String>,
+    /// 本轮到期的定投提醒
+    pub sip_due: Vec<SipReminder>,
+    /// 定投提醒的远程渠道发送结果
+    pub sip_notify_results: Vec<ChannelResult>,
+    /// 有定投到期但未发送通知时的原因
+    pub sip_notify_skipped: Option<String>,
 }
 
 impl CheckReport {
@@ -67,6 +102,13 @@ impl CheckReport {
 
     pub fn notify_success_count(&self) -> usize {
         self.notify_results
+            .iter()
+            .filter(|result| result.ok)
+            .count()
+    }
+
+    pub fn sip_notify_success_count(&self) -> usize {
+        self.sip_notify_results
             .iter()
             .filter(|result| result.ok)
             .count()
@@ -99,6 +141,8 @@ pub async fn check(
     }
 
     let now = chrono::Utc::now().timestamp();
+    let local_now = Local::now();
+    let today = local_now.format("%Y-%m-%d").to_string();
     let mut state = State::load(state_path);
     let mut alerts = Vec::new();
 
@@ -148,6 +192,15 @@ pub async fn check(
                     above,
                     triggered,
                     note: quote.note.clone(),
+                    sip: asset.sip.as_ref().map(|sip| SipInfo {
+                        enabled: sip.enabled,
+                        amount: sip.amount,
+                        schedule: sip.schedule_label(),
+                        next_at: sip
+                            .next_occurrence(local_now)
+                            .map(|next| next.format("%Y-%m-%d %H:%M").to_string()),
+                        due_today: sip.is_due_at(local_now),
+                    }),
                 };
 
                 if triggered {
@@ -220,11 +273,89 @@ pub async fn check(
         }
     }
 
+    let sip_due = collect_sip_due(config, &state, &report.rows, &today, local_now);
+    if !sip_due.is_empty() {
+        if !notify_enabled {
+            report.sip_notify_skipped = Some("通知已暂停".to_string());
+        } else if config.notify.channels.is_empty() {
+            report.sip_notify_skipped = Some("未配置通知渠道".to_string());
+        } else {
+            let notice = build_sip_notice(&sip_due);
+            let results = notify::send_all(client, &config.notify.channels, &notice).await;
+            let mut any_success = false;
+            for result in results {
+                let ok = result.result.is_ok();
+                any_success |= ok;
+                report.sip_notify_results.push(ChannelResult {
+                    label: result.label.to_string(),
+                    ok,
+                    error: result.result.err().map(|error| format!("{error:#}")),
+                });
+            }
+            if any_success {
+                let keys: Vec<String> = sip_due.iter().map(|item| item.key.clone()).collect();
+                state.mark_sip_notified(&keys, &today);
+            }
+        }
+        report.sip_due = sip_due;
+    }
+
     if let Err(error) = state.save(state_path) {
         report.errors.push(format!("保存状态失败：{error:#}"));
     }
 
     report
+}
+
+fn collect_sip_due(
+    config: &Config,
+    state: &State,
+    rows: &[Row],
+    today: &str,
+    now: DateTime<Local>,
+) -> Vec<SipReminder> {
+    config
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            let sip = asset.sip.as_ref()?;
+            if !sip.is_due_at(now) {
+                return None;
+            }
+            let key = asset.key();
+            if state
+                .assets
+                .get(&key)
+                .and_then(|entry| entry.last_sip_notified.as_deref())
+                == Some(today)
+            {
+                return None;
+            }
+
+            let row = rows.iter().find(|row| row.key == key);
+            let price = row.map(|row| row.price);
+            let currency = row.map(|row| row.currency).unwrap_or("CNY").to_string();
+            let estimate_quantity = price
+                .filter(|price| *price > 0.0)
+                .map(|price| sip.amount / price);
+            Some(SipReminder {
+                key,
+                name: row
+                    .map(|row| row.name.clone())
+                    .unwrap_or_else(|| asset.label()),
+                kind: asset.kind.label(),
+                id: asset.id(),
+                amount: sip.amount,
+                currency,
+                price,
+                estimate_quantity,
+                schedule: sip.schedule_label(),
+                next_at: sip
+                    .next_occurrence(now + ChronoDuration::minutes(1))
+                    .map(|next| next.format("%Y-%m-%d %H:%M").to_string()),
+            })
+        })
+        .collect()
 }
 
 pub fn test_notice() -> Notice {
@@ -278,6 +409,50 @@ pub fn build_notice(alerts: &[Row]) -> Notice {
     }
 
     lines.push("—— costline".to_string());
+    Notice {
+        title,
+        body: lines.join("\n"),
+    }
+}
+
+pub fn build_sip_notice(reminders: &[SipReminder]) -> Notice {
+    let title = if reminders.len() == 1 {
+        format!("costline 定投提醒：{}", reminders[0].name)
+    } else {
+        format!("costline 定投提醒（{} 项）", reminders.len())
+    };
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "时间：{}",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    ));
+    lines.push("定投日到了，记得按计划买入：".to_string());
+    lines.push(String::new());
+
+    for item in reminders {
+        lines.push(format!("📥 {}（{}）", item.name, item.id));
+        lines.push(format!(
+            "本期金额 {}{:.2}（{}）",
+            currency_symbol(&item.currency),
+            item.amount,
+            item.currency
+        ));
+        lines.push(format!("定投计划 {}", item.schedule));
+        if let Some(price) = item.price {
+            let estimate = item
+                .estimate_quantity
+                .map(|quantity| format!("，约 {quantity:.2} 份/股"))
+                .unwrap_or_default();
+            lines.push(format!("当前价 {}{estimate}", fmt_price(price)));
+        }
+        if let Some(next) = &item.next_at {
+            lines.push(format!("下次定投 {next}"));
+        }
+        lines.push(String::new());
+    }
+
+    lines.push("—— costline（仅提醒，不会自动下单）".to_string());
     Notice {
         title,
         body: lines.join("\n"),
@@ -346,9 +521,30 @@ mod tests {
             above: true,
             triggered: true,
             note: "东方财富实时".to_string(),
+            sip: None,
         };
         let notice = build_notice(&[row]);
         assert!(notice.title.contains("浦发银行"));
         assert!(notice.body.contains("现价 10.50"));
+    }
+
+    #[test]
+    fn builds_sip_notice() {
+        let reminder = SipReminder {
+            key: "fund:161725".to_string(),
+            name: "招商中证白酒".to_string(),
+            kind: "基金",
+            id: "161725".to_string(),
+            amount: 500.0,
+            currency: "CNY".to_string(),
+            price: Some(0.6),
+            estimate_quantity: Some(833.33),
+            schedule: "每月 1 日 09:30".to_string(),
+            next_at: Some("2026-12-01 09:30".to_string()),
+        };
+        let notice = build_sip_notice(&[reminder]);
+        assert!(notice.title.contains("招商中证白酒"));
+        assert!(notice.body.contains("¥500.00"));
+        assert!(notice.body.contains("每月 1 日 09:30"));
     }
 }

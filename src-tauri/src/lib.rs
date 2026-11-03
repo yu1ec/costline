@@ -73,6 +73,7 @@ fn load_or_init_config(config_path: &Path) -> (Config, Option<String>) {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -104,6 +105,7 @@ pub fn run() {
             commands::save_config,
             commands::check_now,
             commands::set_watching,
+            commands::search_assets,
             commands::test_notify,
             commands::reset_state,
             commands::open_config_dir,

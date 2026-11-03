@@ -22,9 +22,22 @@ pub struct AssetState {
     /// 上一次检查到的价格
     #[serde(default)]
     pub last_price: Option<f64>,
+    /// 最近一次发送定投提醒的日期（YYYY-MM-DD），用于同一天只提醒一次
+    #[serde(default)]
+    pub last_sip_notified: Option<String>,
 }
 
 impl State {
+    /// 记录定投提醒已发送的日期，避免同一天重复提醒。
+    pub fn mark_sip_notified(&mut self, keys: &[String], date: &str) {
+        for key in keys {
+            self.assets
+                .entry(key.clone())
+                .or_default()
+                .last_sip_notified = Some(date.to_string());
+        }
+    }
+
     pub fn load(path: &Path) -> Self {
         let Ok(text) = fs::read_to_string(path) else {
             return Self::default();

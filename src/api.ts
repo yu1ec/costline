@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ChannelResult, Config, Snapshot } from "./types";
+import type {
+  AssetSearchItem,
+  ChannelResult,
+  Config,
+  Snapshot,
+} from "./types";
 
 export const api = {
   getConfig: () => invoke<Config>("get_config"),
@@ -7,6 +12,8 @@ export const api = {
   saveConfig: (config: Config) => invoke<Snapshot>("save_config", { config }),
   checkNow: () => invoke<Snapshot>("check_now"),
   setWatching: (watching: boolean) => invoke<Snapshot>("set_watching", { watching }),
+  searchAssets: (keyword: string) =>
+    invoke<AssetSearchItem[]>("search_assets", { keyword }),
   testNotify: (config: Config) => invoke<ChannelResult[]>("test_notify", { config }),
   resetState: () => invoke<Snapshot>("reset_state"),
   openConfigDir: () => invoke<void>("open_config_dir"),

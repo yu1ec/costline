@@ -31,6 +31,18 @@ export function formatMoney(value: number, currency: string): string {
   })}`;
 }
 
+export function formatAmount(value: number, currency: string): string {
+  return `${currencySymbol(currency)}${value.toLocaleString("zh-CN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+/** 把 2026-12-01 09:30 显示成 12-01 09:30 */
+export function formatSipDate(value: string): string {
+  return value.length >= 16 ? value.slice(5) : value;
+}
+
 export function formatTime(timestamp: number | null): string {
   if (!timestamp) return "尚未检查";
   const date = new Date(timestamp * 1000);

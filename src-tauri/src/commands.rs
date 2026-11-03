@@ -1,4 +1,4 @@
-use costline_core::{config, monitor, notify, Channel, ChannelResult, Config};
+use costline_core::{config, market, monitor, notify, Channel, ChannelResult, Config, SearchItem};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::desktop;
@@ -58,6 +58,18 @@ pub async fn set_watching(app: AppHandle, watching: bool) -> Snapshot {
         });
     }
     snapshot
+}
+
+#[tauri::command]
+pub async fn search_assets(
+    state: State<'_, AppState>,
+    keyword: String,
+) -> Result<Vec<SearchItem>, String> {
+    let config = state.lock().config.clone();
+    let client = monitor::build_client(&config).map_err(|error| format!("{error:#}"))?;
+    market::search_assets(&client, &keyword)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 #[tauri::command]

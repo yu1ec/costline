@@ -4,6 +4,7 @@ import type {
   Channel,
   ChannelType,
   Config,
+  SipFrequency,
 } from "./types";
 
 export interface GlobalDraft {
@@ -25,6 +26,11 @@ export interface AssetDraft {
   principal: string;
   threshold: string;
   target: string;
+  sipEnabled: boolean;
+  sipAmount: string;
+  sipFrequency: SipFrequency;
+  sipDay: string;
+  sipTime: string;
 }
 
 export interface HeaderDraft {
@@ -122,6 +128,11 @@ export function assetToDraft(asset: Asset): AssetDraft {
     principal: numberText(asset.principal),
     threshold: numberText(asset.threshold_percent),
     target: numberText(asset.target_price),
+    sipEnabled: asset.sip?.enabled ?? false,
+    sipAmount: numberText(asset.sip?.amount),
+    sipFrequency: asset.sip?.frequency ?? "monthly",
+    sipDay: asset.sip ? String(asset.sip.day) : "1",
+    sipTime: asset.sip?.time ?? "09:30",
   };
 }
 
@@ -137,6 +148,11 @@ export function emptyAssetDraft(kind: AssetKind = "stock"): AssetDraft {
     principal: "",
     threshold: "",
     target: "",
+    sipEnabled: false,
+    sipAmount: "",
+    sipFrequency: "monthly",
+    sipDay: "1",
+    sipTime: "09:30",
   };
 }
 
@@ -166,6 +182,17 @@ export function draftToAsset(draft: AssetDraft): Asset {
   if (threshold != null) asset.threshold_percent = threshold;
   const target = parseNumber(draft.target);
   if (target != null) asset.target_price = target;
+
+  const sipAmount = parseNumber(draft.sipAmount);
+  if (draft.sipEnabled || sipAmount != null) {
+    asset.sip = {
+      enabled: draft.sipEnabled,
+      amount: sipAmount ?? 0,
+      frequency: draft.sipFrequency,
+      day: Math.trunc(parseNumber(draft.sipDay) ?? 1),
+      time: draft.sipTime.trim() || "09:30",
+    };
+  }
 
   return asset;
 }
@@ -206,7 +233,55 @@ export function assetDraftError(draft: AssetDraft): string | null {
     if (!positive && value < 0) return `${label}不能为负数`;
   }
 
+  const sipAmount = parseNumber(draft.sipAmount);
+  if (sipAmount != null && sipAmount <= 0) {
+    return "定投金额必须大于 0";
+  }
+  if (draft.sipEnabled) {
+    if (sipAmount == null) {
+      return "请填写定投金额";
+    }
+    const day = parseNumber(draft.sipDay);
+    if (day == null || !Number.isInteger(day)) {
+      return "定投日不是有效数字";
+    }
+    if (draft.sipFrequency === "weekly" && (day < 1 || day > 7)) {
+      return "每周定投日请选择周一到周日";
+    }
+    if (draft.sipFrequency === "monthly" && (day < 1 || day > 31)) {
+      return "每月定投日必须在 1-31 之间";
+    }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(draft.sipTime.trim())) {
+      return "定投提醒时间格式应为 HH:MM";
+    }
+  }
+
   return null;
+}
+
+export const WEEKDAY_LABELS = [
+  "周一",
+  "周二",
+  "周三",
+  "周四",
+  "周五",
+  "周六",
+  "周日",
+];
+
+export function sipScheduleLabel(draft: AssetDraft): string {
+  const day = Math.trunc(parseNumber(draft.sipDay) ?? 1);
+  const dayText =
+    draft.sipFrequency === "weekly"
+      ? WEEKDAY_LABELS[Math.min(Math.max(day, 1), 7) - 1]
+      : `每月 ${day} 日`;
+  return `${dayText} ${draft.sipTime.trim() || "09:30"}`;
+}
+
+export function assetDraftKey(draft: AssetDraft): string {
+  const id =
+    draft.secid.trim() || draft.symbol.trim() || draft.code.trim() || "?";
+  return `${draft.kind}:${id.toLowerCase()}`;
 }
 
 export function assetPrimaryCode(draft: AssetDraft): string {

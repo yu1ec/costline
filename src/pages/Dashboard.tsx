@@ -3,32 +3,45 @@ import {
   Bell,
   CheckCircle2,
   LineChart,
+  Plus,
   RefreshCw,
   Wallet,
 } from "lucide-react";
+import { useState } from "react";
 import type { Config, Snapshot } from "../types";
+import { emptyAssetDraft, type AssetDraft } from "../drafts";
 import {
   currencySymbol,
+  formatAmount,
   formatMoney,
   formatPercent,
   formatPrice,
+  formatSipDate,
   formatTime,
 } from "../format";
 import { EmptyState, Tag } from "../components/ui";
+import { AssetModal } from "../components/AssetModal";
+
+const REDACTED = "••••";
 
 export function Dashboard({
   config,
   snapshot,
   busy,
+  hideAmounts,
   onCheck,
+  onAddAsset,
   onOpenSettings,
 }: {
   config: Config | null;
   snapshot: Snapshot | null;
   busy: boolean;
+  hideAmounts: boolean;
   onCheck: () => void;
+  onAddAsset: (draft: AssetDraft) => Promise<boolean>;
   onOpenSettings: () => void;
 }) {
+  const [adding, setAdding] = useState(false);
   const rows = snapshot?.rows ?? [];
   const assetsCount = snapshot?.assets_count ?? config?.assets.length ?? 0;
   const recovered = rows.filter((row) => row.above).length;
@@ -81,6 +94,8 @@ export function Dashboard({
             <span>浮动盈亏</span>
             {totals.size === 0 ? (
               <strong className="muted">—</strong>
+            ) : hideAmounts ? (
+              <strong className="muted">{REDACTED}</strong>
             ) : (
               <div className="pnl-list">
                 {[...totals.entries()].map(([currency, value]) => (
@@ -119,10 +134,20 @@ export function Dashboard({
               每 {snapshot?.interval_secs ?? config?.interval_secs ?? 60} 秒刷新
             </p>
           </div>
-          <button type="button" className="btn" onClick={onCheck} disabled={busy}>
-            <RefreshCw size={15} className={busy ? "spin" : ""} />
-            {busy ? "检查中" : "立即检查"}
-          </button>
+          <div className="panel-actions">
+            <button
+              type="button"
+              className="btn primary"
+              onClick={() => setAdding(true)}
+            >
+              <Plus size={15} />
+              添加持仓
+            </button>
+            <button type="button" className="btn" onClick={onCheck} disabled={busy}>
+              <RefreshCw size={15} className={busy ? "spin" : ""} />
+              {busy ? "检查中" : "立即检查"}
+            </button>
+          </div>
         </div>
 
         {assetsCount === 0 ? (
@@ -162,15 +187,36 @@ export function Dashboard({
                     {row.id}
                     {row.note ? ` · ${row.note}` : ""}
                   </span>
+                  {row.sip?.enabled ? (
+                    <span
+                      className={row.sip.due_today ? "asset-sip due" : "asset-sip"}
+                    >
+                      定投{" "}
+                      {hideAmounts
+                        ? REDACTED
+                        : formatAmount(row.sip.amount, row.currency)}{" "}
+                      · {row.sip.schedule}
+                      {row.sip.due_today
+                        ? " · 今日"
+                        : row.sip.next_at
+                          ? ` · 下次 ${formatSipDate(row.sip.next_at)}`
+                          : ""}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="cell">
                   <strong className="mono price">{formatPrice(row.price)}</strong>
                   <span className="cell-sub">{row.currency}</span>
                 </div>
                 <div className="cell">
-                  <span className="mono">{formatPrice(row.cost)}</span>
+                  <span className="mono">
+                    {hideAmounts ? REDACTED : formatPrice(row.cost)}
+                  </span>
                   <span className="cell-sub">
-                    触发 <span className="mono">{formatPrice(row.target)}</span>
+                    触发{" "}
+                    <span className="mono">
+                      {hideAmounts ? REDACTED : formatPrice(row.target)}
+                    </span>
                   </span>
                 </div>
                 <div className="cell">
@@ -187,7 +233,9 @@ export function Dashboard({
                   </span>
                 </div>
                 <div className="cell">
-                  {row.pnl == null ? (
+                  {hideAmounts ? (
+                    <span className="muted">{REDACTED}</span>
+                  ) : row.pnl == null ? (
                     <span className="muted">—</span>
                   ) : (
                     <span className={row.pnl >= 0 ? "mono up" : "mono down"}>
@@ -219,6 +267,18 @@ export function Dashboard({
               .join(" / ")}。`
           : ""}
       </p>
+
+      {adding ? (
+        <AssetModal
+          initial={emptyAssetDraft()}
+          index={null}
+          globalThreshold={config?.threshold_percent ?? 0}
+          onSave={async (draft) => {
+            if (await onAddAsset(draft)) setAdding(false);
+          }}
+          onClose={() => setAdding(false)}
+        />
+      ) : null}
     </div>
   );
 }

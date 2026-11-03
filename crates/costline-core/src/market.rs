@@ -1,8 +1,204 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::{Asset, AssetKind};
+
+/// 东方财富搜索接口返回的一条候选资产。
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchItem {
+    /// stock / fund / gold
+    pub kind: &'static str,
+    pub name: String,
+    /// 原始代码，例如 600000 / 00700 / 161725 / AU9999
+    pub code: String,
+    /// 适合直接填进 Asset.symbol 的代码
+    pub symbol: Option<String>,
+    /// 东方财富 secid，例如 1.600000 / 116.00700 / 118.AU9999
+    pub secid: Option<String>,
+    /// 市场说明，例如 沪A / 深A / 港股 / 美股 / 基金
+    pub market: Option<String>,
+}
+
+const SEARCH_TOKEN: &str = "D43BF722C8E33BDC906FB84D85E326E8";
+
+/// 通过名称或代码搜索支持的资产（股票 / 基金 / 黄金）。
+pub async fn search_assets(client: &Client, keyword: &str) -> Result<Vec<SearchItem>> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut last_error = None;
+    for host in [
+        "https://searchapi.eastmoney.com",
+        "https://searchadapter.eastmoney.com",
+    ] {
+        match fetch_search(client, host, keyword).await {
+            Ok(items) => return Ok(items),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("搜索失败")))
+}
+
+async fn fetch_search(client: &Client, host: &str, keyword: &str) -> Result<Vec<SearchItem>> {
+    let url = format!("{host}/api/suggest/get");
+    let response = client
+        .get(&url)
+        .query(&[
+            ("input", keyword),
+            ("type", "14"),
+            ("token", SEARCH_TOKEN),
+            ("count", "20"),
+        ])
+        .header("Referer", "https://quote.eastmoney.com/")
+        .send()
+        .await
+        .context("请求东方财富搜索失败")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("东方财富搜索返回 HTTP {status}：{}", truncate(&body, 200));
+    }
+
+    // 接口通常是 JSON，偶尔会包一层 JSONP。
+    let trimmed = body.trim().trim_start_matches('\u{feff}');
+    let json = if trimmed.starts_with('{') {
+        trimmed
+    } else {
+        extract_jsonp(trimmed).ok_or_else(|| anyhow!("搜索接口返回格式异常"))?
+    };
+    let value: Value = serde_json::from_str(json).context("解析东方财富搜索 JSON 失败")?;
+    let data = value
+        .pointer("/QuotationCodeTable/Data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(data.iter().filter_map(parse_search_item).take(20).collect())
+}
+
+fn parse_search_item(value: &Value) -> Option<SearchItem> {
+    let code = value
+        .get("Code")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
+    if code.is_empty() {
+        return None;
+    }
+    let name = value
+        .get("Name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&code)
+        .to_string();
+    let quote_id = value
+        .get("QuoteID")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let classify = value
+        .get("Classify")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+    let security_type = value
+        .get("SecurityTypeName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let kind = infer_search_kind(&classify, &security_type, &code, quote_id.as_deref())?;
+    let symbol = match kind {
+        "fund" => None,
+        "stock" => Some(stock_search_symbol(&code, quote_id.as_deref())),
+        _ => Some(code.clone()),
+    };
+    // 场外基金走 fundgz / 蛋卷，不要把它们的 150.* 之类的伪 secid 填进配置。
+    let secid = match kind {
+        "fund" if !is_exchange_fund(&code) => None,
+        _ => quote_id,
+    };
+    let market = if security_type.is_empty() {
+        None
+    } else {
+        Some(security_type)
+    };
+
+    Some(SearchItem {
+        kind,
+        name,
+        code,
+        symbol,
+        secid,
+        market,
+    })
+}
+
+fn infer_search_kind(
+    classify: &str,
+    security_type: &str,
+    code: &str,
+    quote_id: Option<&str>,
+) -> Option<&'static str> {
+    let quote_id = quote_id.unwrap_or_default();
+    let upper_code = code.to_uppercase();
+
+    if classify.contains("index")
+        || classify.contains("bond")
+        || security_type.contains("指数")
+        || security_type.contains("债")
+    {
+        return None;
+    }
+
+    if classify.contains("fund")
+        || security_type.contains("基金")
+        || security_type.to_uppercase().contains("ETF")
+    {
+        return Some("fund");
+    }
+
+    if classify.contains("gold")
+        || classify == "sge"
+        || security_type.contains("黄金")
+        || security_type.contains("白银")
+        || quote_id.starts_with("118.")
+        || (quote_id.starts_with("113.") && upper_code.starts_with("AU"))
+    {
+        return Some("gold");
+    }
+
+    let stock_classify = matches!(
+        classify,
+        "astock" | "abstock" | "hkstock" | "hk" | "usstock" | "stock"
+    );
+    let stock_quote = quote_id.starts_with("1.")
+        || quote_id.starts_with("0.")
+        || quote_id.starts_with("105.")
+        || quote_id.starts_with("106.")
+        || quote_id.starts_with("107.")
+        || quote_id.starts_with("116.");
+    if stock_classify || stock_quote {
+        return Some("stock");
+    }
+
+    None
+}
+
+fn stock_search_symbol(code: &str, quote_id: Option<&str>) -> String {
+    if quote_id.is_some_and(|id| id.starts_with("116.")) && !code.to_uppercase().ends_with(".HK") {
+        return format!("{code}.HK");
+    }
+    code.to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct Quote {
@@ -572,5 +768,49 @@ mod tests {
         assert_eq!(currency_of_secid("116.00700"), "HKD");
         assert_eq!(currency_of_secid("105.AAPL"), "USD");
         assert_eq!(currency_of_secid("1.600000"), "CNY");
+    }
+
+    #[test]
+    fn parses_search_results() {
+        let value: Value = serde_json::from_str(
+            r#"{
+                "QuotationCodeTable": {
+                    "Data": [
+                        {"Code":"600000","Name":"浦发银行","JYS":"SH","Classify":"AStock","SecurityTypeName":"沪A","QuoteID":"1.600000"},
+                        {"Code":"161725","Name":"招商中证白酒","Classify":"OTCFUND","SecurityTypeName":"基金","QuoteID":"150.161725"},
+                        {"Code":"518880","Name":"黄金ETF","Classify":"Fund","SecurityTypeName":"基金","QuoteID":"1.518880"},
+                        {"Code":"00700","Name":"腾讯控股","Classify":"HK","SecurityTypeName":"港股","QuoteID":"116.00700"},
+                        {"Code":"AU9999","Name":"黄金9999","Classify":"SGE","SecurityTypeName":"现货","QuoteID":"118.AU9999"},
+                        {"Code":"000001","Name":"上证指数","Classify":"Index","SecurityTypeName":"指数","QuoteID":"1.000001"},
+                        {"Code":"113050","Name":"南银转债","Classify":"ConvertibleBond","SecurityTypeName":"可转债","QuoteID":"1.113050"}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let items: Vec<SearchItem> = value
+            .pointer("/QuotationCodeTable/Data")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(parse_search_item)
+            .collect();
+
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].kind, "stock");
+        assert_eq!(items[0].symbol.as_deref(), Some("600000"));
+        assert_eq!(items[1].kind, "fund");
+        assert_eq!(items[1].symbol, None);
+        assert_eq!(items[1].secid, None, "场外基金不应使用 150.* 作为 secid");
+        assert_eq!(items[2].kind, "fund");
+        assert_eq!(
+            items[2].secid.as_deref(),
+            Some("1.518880"),
+            "场内基金保留 secid"
+        );
+        assert_eq!(items[3].kind, "stock");
+        assert_eq!(items[3].symbol.as_deref(), Some("00700.HK"));
+        assert_eq!(items[4].kind, "gold");
+        assert_eq!(items[4].secid.as_deref(), Some("118.AU9999"));
     }
 }

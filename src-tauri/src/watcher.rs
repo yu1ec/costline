@@ -17,6 +17,14 @@ pub struct AlertPayload {
     pub rows: Vec<Row>,
 }
 
+/// 推送给前端的定投提醒。
+#[derive(Debug, Clone, Serialize)]
+pub struct SipPayload {
+    pub title: String,
+    pub body: String,
+    pub reminders: Vec<monitor::SipReminder>,
+}
+
 /// 后台盯盘循环：每秒醒来一次，到了间隔就检查一轮。
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -76,6 +84,7 @@ pub async fn run_check(app: &AppHandle, notify_enabled: bool, force_notify: bool
         .retain(|channel| !matches!(channel, Channel::Desktop { .. }));
 
     let mut alert: Option<AlertPayload> = None;
+    let mut sip_alert: Option<SipPayload> = None;
 
     let snapshot = match monitor::build_client(&config) {
         Ok(client) => {
@@ -97,6 +106,24 @@ pub async fn run_check(app: &AppHandle, notify_enabled: bool, force_notify: bool
                     title: notice.title,
                     body: notice.body,
                     rows: report.triggered.clone(),
+                });
+            }
+
+            if notify_enabled && !report.sip_due.is_empty() {
+                let notice = monitor::build_sip_notice(&report.sip_due);
+                match desktop::send(app, &notice, desktop_sound.as_deref()) {
+                    Ok(()) => {
+                        // 远程渠道都没有成功时，由系统通知来记录今天的定投提醒状态。
+                        if report.sip_notify_success_count() == 0 {
+                            mark_sip_notified(&state_path, &report.sip_due);
+                        }
+                    }
+                    Err(error) => eprintln!("[costline] 定投系统通知发送失败：{error}"),
+                }
+                sip_alert = Some(SipPayload {
+                    title: notice.title,
+                    body: notice.body,
+                    reminders: report.sip_due.clone(),
                 });
             }
 
@@ -136,7 +163,20 @@ pub async fn run_check(app: &AppHandle, notify_enabled: bool, force_notify: bool
     if let Some(alert) = alert {
         let _ = app.emit("alert", alert);
     }
+    if let Some(sip) = sip_alert {
+        let _ = app.emit("sip", sip);
+    }
     snapshot
+}
+
+fn mark_sip_notified(state_path: &Path, reminders: &[monitor::SipReminder]) {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let keys: Vec<String> = reminders.iter().map(|item| item.key.clone()).collect();
+    let mut state = State::load(state_path);
+    state.mark_sip_notified(&keys, &today);
+    if let Err(error) = state.save(state_path) {
+        eprintln!("[costline] 保存定投提醒状态失败：{error:#}");
+    }
 }
 
 fn mark_notified(state_path: &Path, rows: &[Row]) {

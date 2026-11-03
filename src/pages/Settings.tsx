@@ -16,6 +16,7 @@ import type { DisguiseMode, DisguisePersonaId } from "../disguise";
 import type { AssetDraft, ChannelDraft, GlobalDraft } from "../drafts";
 import {
   assetDraftError,
+  assetDraftKey,
   assetPrimaryCode,
   assetToDraft,
   assetDerivedCost,
@@ -30,8 +31,10 @@ import {
   emptyAssetDraft,
   emptyChannelDraft,
   kindLabel,
+  parseNumber,
+  sipScheduleLabel,
 } from "../drafts";
-import { formatPrice } from "../format";
+import { formatAmount, formatPrice } from "../format";
 import { api } from "../api";
 import type { UpdateController } from "../updater";
 import { AssetModal } from "../components/AssetModal";
@@ -93,11 +96,11 @@ export function Settings({
 
   useEffect(() => {
     const next = configToDraft(config);
-    setGlobal(next.global);
+    // 资产和渠道会自动保存；基础参数没保存时不要被配置刷新覆盖。
+    setGlobal((current) => (dirty ? current : next.global));
     setAssets(next.assets);
     setChannels(next.channels);
-    setDirty(false);
-  }, [config]);
+  }, [config, dirty]);
 
   function updateGlobal<K extends keyof GlobalDraft>(key: K, value: GlobalDraft[K]) {
     setGlobal((current) => ({ ...current, [key]: value }));
@@ -187,46 +190,86 @@ export function Settings({
     }
   }
 
-  function saveAsset(draft: AssetDraft) {
-    const index = assetModal?.index ?? null;
-    setAssets((current) =>
-      index == null
-        ? [...current, draft]
-        : current.map((item, position) => (position === index ? draft : item)),
-    );
-    setAssetModal(null);
-    setDirty(true);
+  /// 资产 / 渠道改动后立即写盘；基础参数仍走底部「保存」按钮。
+  async function autoSave(
+    nextAssets: AssetDraft[],
+    nextChannels: ChannelDraft[],
+    message: string,
+  ): Promise<boolean> {
+    const payload = draftToConfig({
+      global: configToDraft(config).global,
+      assets: nextAssets,
+      channels: nextChannels,
+    });
+    try {
+      const nextSnapshot = await api.saveConfig(payload);
+      setAssets(nextAssets);
+      setChannels(nextChannels);
+      onSaved(payload, nextSnapshot);
+      onToast(message, "ok");
+      return true;
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+      return false;
+    }
   }
 
-  function removeAsset(index: number) {
+  async function saveAsset(draft: AssetDraft) {
+    const index = assetModal?.index ?? null;
+    const next =
+      index == null
+        ? [...assets, draft]
+        : assets.map((item, position) => (position === index ? draft : item));
+    const ok = await autoSave(
+      next,
+      channels,
+      index == null ? "资产已添加并生效" : "资产已保存并生效",
+    );
+    if (ok) setAssetModal(null);
+  }
+
+  async function removeAsset(index: number) {
     const name =
       assets[index].name.trim() || assetPrimaryCode(assets[index]) || "这个资产";
     if (!window.confirm(`确定删除「${name}」吗？`)) return;
-    setAssets((current) => current.filter((_, position) => position !== index));
-    setDirty(true);
-  }
-
-  function saveChannel(draft: ChannelDraft) {
-    const index = channelModal?.index ?? null;
-    setChannels((current) =>
-      index == null
-        ? [...current, draft]
-        : current.map((item, position) => (position === index ? draft : item)),
+    await autoSave(
+      assets.filter((_, position) => position !== index),
+      channels,
+      "资产已删除",
     );
-    setChannelModal(null);
-    setDirty(true);
   }
 
-  function removeChannel(index: number) {
+  async function saveChannel(draft: ChannelDraft) {
+    const index = channelModal?.index ?? null;
+    const next =
+      index == null
+        ? [...channels, draft]
+        : channels.map((item, position) => (position === index ? draft : item));
+    const ok = await autoSave(
+      assets,
+      next,
+      index == null ? "通知渠道已添加并生效" : "通知渠道已保存并生效",
+    );
+    if (ok) setChannelModal(null);
+  }
+
+  async function removeChannel(index: number) {
     if (!window.confirm(`确定删除「${channelLabel(channels[index].type)}」渠道吗？`)) {
       return;
     }
-    setChannels((current) => current.filter((_, position) => position !== index));
-    setDirty(true);
+    await autoSave(
+      assets,
+      channels.filter((_, position) => position !== index),
+      "通知渠道已删除",
+    );
   }
 
   const globalThreshold = Number(global.threshold) || 0;
   const configPath = snapshot?.config_path ?? "";
+  const currencyByKey = new Map<string, string>();
+  for (const row of snapshot?.rows ?? []) {
+    currencyByKey.set(row.key, row.currency);
+  }
 
   return (
     <div className="page settings-page">
@@ -320,6 +363,22 @@ export function Settings({
                       <span className="dot">·</span>
                       触发{" "}
                       <span className="mono accent">{formatPrice(target)}</span>
+                      {asset.sipEnabled ? (
+                        <>
+                          <span className="dot">·</span>
+                          <span className="sip-meta">
+                            定投{" "}
+                            <span className="mono">
+                              {formatAmount(
+                                parseNumber(asset.sipAmount) ?? 0,
+                                currencyByKey.get(assetDraftKey(asset)) ?? "CNY",
+                              )}
+                            </span>
+                            <span className="dot">·</span>
+                            {sipScheduleLabel(asset)}
+                          </span>
+                        </>
+                      ) : null}
                     </span>
                   </div>
                   <div className="item-actions">
@@ -463,7 +522,9 @@ export function Settings({
       <div className="settings-footer">
         <div className="settings-footer-info">
           <span className={dirty ? "dirty-dot active" : "dirty-dot"} />
-          <span>{dirty ? "有未保存的修改" : "配置已保存"}</span>
+          <span>
+            {dirty ? "基础参数有未保存的修改" : "基础参数已保存（资产与渠道自动保存）"}
+          </span>
           {configPath ? <span className="config-path">{configPath}</span> : null}
         </div>
         <div className="settings-footer-actions">

@@ -18,11 +18,12 @@ export function ChannelModal({
 }: {
   initial: ChannelDraft;
   index: number | null;
-  onSave: (draft: ChannelDraft) => void;
+  onSave: (draft: ChannelDraft) => void | Promise<void>;
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState<ChannelDraft>({ ...initial });
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   function set<K extends keyof ChannelDraft>(key: K, value: ChannelDraft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -33,13 +34,18 @@ export function ChannelModal({
     setError(null);
   }
 
-  function submit() {
+  async function submit() {
     const problem = channelDraftError(draft);
     if (problem) {
       setError(problem);
       return;
     }
-    onSave(draft);
+    setSubmitting(true);
+    try {
+      await onSave(draft);
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   function updateHeader(index: number, patch: Partial<HeaderDraft>) {
@@ -62,8 +68,13 @@ export function ChannelModal({
           <button type="button" className="btn ghost" onClick={onClose}>
             取消
           </button>
-          <button type="button" className="btn primary" onClick={submit}>
-            {index == null ? "添加" : "保存"}
+          <button
+            type="button"
+            className="btn primary"
+            onClick={submit}
+            disabled={submitting}
+          >
+            {submitting ? "保存中…" : index == null ? "添加" : "保存"}
           </button>
         </>
       }

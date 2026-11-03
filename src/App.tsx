@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Bell,
   Download,
+  Eye,
   EyeOff,
   LineChart,
   Moon,
@@ -17,7 +18,8 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api";
-import type { AlertPayload, Config, Snapshot } from "./types";
+import type { AlertPayload, Config, SipPayload, Snapshot } from "./types";
+import { draftToAsset, type AssetDraft } from "./drafts";
 import {
   DISGUISE_PERSONAS,
   loadDisguisePrefs,
@@ -28,7 +30,7 @@ import {
 import { Dashboard } from "./pages/Dashboard";
 import { Settings } from "./pages/Settings";
 import { DisguiseScreen, MaskedBoard } from "./components/Disguise";
-import { formatPrice, formatTime } from "./format";
+import { formatAmount, formatPrice, formatTime } from "./format";
 import { useUpdateController } from "./updater";
 
 type Tab = "dashboard" | "settings";
@@ -49,8 +51,12 @@ export default function App() {
   const [fatal, setFatal] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [alert, setAlert] = useState<AlertPayload | null>(null);
+  const [sipAlert, setSipAlert] = useState<SipPayload | null>(null);
   const [theme, setTheme] = useState<Theme>(() =>
     document.documentElement.dataset.theme === "light" ? "light" : "dark",
+  );
+  const [hideAmounts, setHideAmounts] = useState(
+    () => localStorage.getItem("costline-hide-amounts") === "1",
   );
   const [disguise, setDisguise] = useState<DisguiseState>(() => {
     const prefs = loadDisguisePrefs();
@@ -112,6 +118,21 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<SipPayload>("sip", (event) => setSipAlert(event.payload)).then(
+      (stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      },
+    );
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   const showToast = useCallback(
     (text: string, tone: "ok" | "error" = "ok") => {
       setToast({ id: Date.now(), text, tone });
@@ -145,6 +166,10 @@ export default function App() {
   }, [disguise.persona, disguise.auto]);
 
   useEffect(() => {
+    localStorage.setItem("costline-hide-amounts", hideAmounts ? "1" : "0");
+  }, [hideAmounts]);
+
+  useEffect(() => {
     const title =
       disguise.mode === "off" ? "Costline 盯盘" : personaMeta.windowTitle;
     document.title = title;
@@ -168,6 +193,7 @@ export default function App() {
       if (key !== "h" && key !== "m") return;
       event.preventDefault();
       setAlert(null);
+      setSipAlert(null);
       setToast(null);
       setDisguise((current) => {
         const target: Exclude<DisguiseMode, "off"> = key === "h" ? "full" : "mask";
@@ -180,6 +206,7 @@ export default function App() {
 
   const enterDisguise = useCallback((mode: Exclude<DisguiseMode, "off">) => {
     setAlert(null);
+    setSipAlert(null);
     setToast(null);
     setDisguise((current) => ({ ...current, mode }));
   }, []);
@@ -222,6 +249,24 @@ export default function App() {
       showToast(errorMessage(error), "error");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function addAsset(draft: AssetDraft): Promise<boolean> {
+    if (!config) return false;
+    const payload: Config = {
+      ...config,
+      assets: [...config.assets, draftToAsset(draft)],
+    };
+    try {
+      const nextSnapshot = await api.saveConfig(payload);
+      setConfig(payload);
+      setSnapshot(nextSnapshot);
+      showToast("资产已添加并生效");
+      return true;
+    } catch (error) {
+      showToast(errorMessage(error), "error");
+      return false;
     }
   }
 
@@ -296,6 +341,16 @@ export default function App() {
           </button>
           {tab === "dashboard" ? (
             <>
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => setHideAmounts((current) => !current)}
+                title={hideAmounts ? "显示投资数据" : "隐藏投资数据"}
+                aria-pressed={hideAmounts}
+              >
+                {hideAmounts ? <Eye size={15} /> : <EyeOff size={15} />}
+                {hideAmounts ? "显示" : "隐藏"}
+              </button>
               <button type="button" className="btn ghost" onClick={toggleWatch} disabled={busy}>
                 {snapshot?.watching ? <Pause size={15} /> : <Play size={15} />}
                 {snapshot?.watching ? "暂停" : "继续"}
@@ -368,6 +423,50 @@ export default function App() {
         </div>
       ) : null}
 
+      {sipAlert ? (
+        <div
+          className={alert ? "alert-toast sip stacked" : "alert-toast sip"}
+          role="alert"
+        >
+          <div className="alert-toast-icon">
+            <Bell size={17} />
+          </div>
+          <div className="alert-toast-content">
+            <strong>{sipAlert.title}</strong>
+            <span>
+              {sipAlert.reminders
+                .slice(0, 3)
+                .map(
+                  (item) =>
+                    `${item.name} ${formatAmount(item.amount, item.currency)}`,
+                )
+                .join(" · ")}
+              {sipAlert.reminders.length > 3
+                ? ` · 等 ${sipAlert.reminders.length} 项`
+                : ""}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => {
+              setTab("dashboard");
+              setSipAlert(null);
+            }}
+          >
+            查看
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            aria-label="关闭定投提醒"
+            onClick={() => setSipAlert(null)}
+          >
+            <X size={15} />
+          </button>
+        </div>
+      ) : null}
+
       <main className="app-main">
         {booting ? (
           <div className="boot-state">
@@ -388,7 +487,9 @@ export default function App() {
             config={config}
             snapshot={snapshot}
             busy={busy}
+            hideAmounts={hideAmounts}
             onCheck={checkNow}
+            onAddAsset={addAsset}
             onOpenSettings={() => setTab("settings")}
           />
         ) : (

@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Timelike,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +98,143 @@ impl AssetKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SipFrequency {
+    Weekly,
+    Monthly,
+}
+
+/// 定期定额投资提醒。只负责到点提醒，不会自动下单。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SipPlan {
+    /// 关闭后保留配置，但不再提醒
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 每期定投金额
+    pub amount: f64,
+    pub frequency: SipFrequency,
+    /// 每周：1-7（周一 = 1）；每月：1-31（超过当月天数时按当月最后一天）
+    pub day: u8,
+    /// 提醒时间，格式 HH:MM
+    #[serde(default = "default_sip_time")]
+    pub time: String,
+}
+
+impl SipPlan {
+    pub fn time_parts(&self) -> Option<(u32, u32)> {
+        let (hour, minute) = self.time.trim().split_once(':')?;
+        let hour: u32 = hour.trim().parse().ok()?;
+        let minute: u32 = minute.trim().parse().ok()?;
+        if hour < 24 && minute < 60 {
+            Some((hour, minute))
+        } else {
+            None
+        }
+    }
+
+    pub fn schedule_label(&self) -> String {
+        let time = self.time.trim();
+        match self.frequency {
+            SipFrequency::Weekly => {
+                let weekday = weekday_label(self.day).unwrap_or("每周");
+                format!("{weekday} {time}")
+            }
+            SipFrequency::Monthly => format!("每月 {} 日 {time}", self.day),
+        }
+    }
+
+    /// 今天是否为定投日，且提醒时间已到。
+    pub fn is_due_at(&self, now: DateTime<Local>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some((hour, minute)) = self.time_parts() else {
+            return false;
+        };
+        if now.hour() * 60 + now.minute() < hour * 60 + minute {
+            return false;
+        }
+        match self.frequency {
+            SipFrequency::Weekly => now.weekday().num_days_from_monday() + 1 == self.day as u32,
+            SipFrequency::Monthly => {
+                now.day() == self.day.min(last_day_of_month(now.year(), now.month())) as u32
+            }
+        }
+    }
+
+    /// 下一次定投时间；用于界面展示。
+    pub fn next_occurrence(&self, from: DateTime<Local>) -> Option<NaiveDateTime> {
+        let (hour, minute) = self.time_parts()?;
+        for offset in 0..=62 {
+            let date = from.date_naive() + ChronoDuration::days(offset);
+            let matches = match self.frequency {
+                SipFrequency::Weekly => {
+                    date.weekday().num_days_from_monday() + 1 == self.day as u32
+                }
+                SipFrequency::Monthly => {
+                    date.day() == self.day.min(last_day_of_month(date.year(), date.month())) as u32
+                }
+            };
+            if !matches {
+                continue;
+            }
+            let candidate = date.and_hms_opt(hour, minute, 0)?;
+            if candidate > from.naive_local() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.amount.is_finite() || self.amount <= 0.0 {
+            bail!("定投金额必须大于 0");
+        }
+        match self.frequency {
+            SipFrequency::Weekly => {
+                if !(1..=7).contains(&self.day) {
+                    bail!("每周定投日必须是 1-7（周一 = 1）");
+                }
+            }
+            SipFrequency::Monthly => {
+                if !(1..=31).contains(&self.day) {
+                    bail!("每月定投日必须是 1-31");
+                }
+            }
+        }
+        if self.time_parts().is_none() {
+            bail!("定投提醒时间格式应为 HH:MM");
+        }
+        Ok(())
+    }
+}
+
+fn weekday_label(day: u8) -> Option<&'static str> {
+    const LABELS: [&str; 7] = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+    LABELS.get((day as usize).checked_sub(1)?).copied()
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u8 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .and_then(|date| date.pred_opt())
+        .map(|date| date.day() as u8)
+        .unwrap_or(28)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_sip_time() -> String {
+    "09:30".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Asset {
     pub kind: AssetKind,
@@ -125,6 +265,9 @@ pub struct Asset {
     /// 明确的触发价，优先级高于成本价与阈值
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_price: Option<f64>,
+    /// 定投提醒配置，股票、基金、黄金都支持
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sip: Option<SipPlan>,
 }
 
 impl Asset {
@@ -215,6 +358,11 @@ impl Asset {
             if !threshold.is_finite() || threshold < 0.0 {
                 bail!("资产「{label}」的 threshold_percent 不能为负数（触发条件是现价高于成本）");
             }
+        }
+
+        if let Some(sip) = &self.sip {
+            sip.validate()
+                .with_context(|| format!("资产「{label}」的定投配置无效"))?;
         }
 
         Ok(())
@@ -513,6 +661,15 @@ code = "161725"          # 场外基金代码
 cost = 0.5877
 quantity = 10000
 
+# 定投提醒：股票、基金、黄金都支持。
+# 到定投日（默认 09:30 之后）会发一次通知，只提醒、不会自动下单。
+[assets.sip]
+enabled = false          # 示例默认关闭，改成 true 后生效
+amount = 500.00          # 每期金额
+frequency = "monthly"    # weekly / monthly
+day = 1                  # 每月 1 日；weekly 时为 1-7（周一 = 1）
+time = "09:30"           # 提醒时间 HH:MM
+
 [[assets]]
 kind = "gold"
 name = "黄金9999"
@@ -547,6 +704,8 @@ mod tests {
         config.validate().expect("sample config should validate");
         assert_eq!(config.assets.len(), 3);
         assert_eq!(config.assets[0].cost_price(), Some(10.0));
+        assert!(config.assets[1].sip.is_some());
+        assert!(config.assets[2].sip.is_none());
     }
 
     #[test]
@@ -556,6 +715,8 @@ mod tests {
         let parsed: Config = toml::from_str(&text).expect("serialized config should parse");
         assert_eq!(parsed.assets.len(), 3);
         assert_eq!(parsed.assets[2].target_price(0.0), Some(800.0));
+        assert!(parsed.assets[1].sip.is_some());
+        assert!(parsed.assets[2].sip.is_none());
     }
 
     #[test]
@@ -571,6 +732,7 @@ mod tests {
             principal: Some(12000.0),
             threshold_percent: None,
             target_price: None,
+            sip: None,
         };
         asset.validate().unwrap();
         assert_eq!(asset.cost_price(), Some(12.0));
@@ -657,7 +819,85 @@ cost = 800.0
             principal: None,
             threshold_percent: None,
             target_price: Some(900.0),
+            sip: None,
         };
         assert_eq!(asset.target_price(10.0), Some(900.0));
+    }
+
+    #[test]
+    fn sip_plan_parses_from_asset() {
+        let text = r#"
+[[assets]]
+kind = "fund"
+code = "161725"
+cost = 0.5877
+
+[assets.sip]
+amount = 500.0
+frequency = "monthly"
+day = 1
+time = "09:30"
+"#;
+        let config: Config = toml::from_str(text).expect("sip config should parse");
+        config.validate().expect("sip config should validate");
+        let sip = config.assets[0].sip.as_ref().expect("sip should exist");
+        assert!(sip.enabled);
+        assert_eq!(sip.amount, 500.0);
+        assert_eq!(sip.schedule_label(), "每月 1 日 09:30");
+    }
+
+    #[test]
+    fn sip_monthly_due_clamps_to_last_day() {
+        use chrono::TimeZone;
+
+        let sip = SipPlan {
+            enabled: true,
+            amount: 100.0,
+            frequency: SipFrequency::Monthly,
+            day: 31,
+            time: "09:30".into(),
+        };
+        // 2026 年 2 月只有 28 天，31 日按当月最后一天处理。
+        let early = Local.with_ymd_and_hms(2026, 2, 28, 9, 0, 0).unwrap();
+        let due = Local.with_ymd_and_hms(2026, 2, 28, 9, 30, 0).unwrap();
+        assert!(!sip.is_due_at(early));
+        assert!(sip.is_due_at(due));
+
+        let next = sip.next_occurrence(early).expect("next occurrence");
+        assert_eq!(
+            next.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-02-28 09:30"
+        );
+    }
+
+    #[test]
+    fn sip_weekly_due_matches_weekday() {
+        use chrono::TimeZone;
+
+        let sip = SipPlan {
+            enabled: true,
+            amount: 100.0,
+            frequency: SipFrequency::Weekly,
+            day: 1, // 周一
+            time: "08:00".into(),
+        };
+        // 2026-11-02 是周一。
+        let due = Local.with_ymd_and_hms(2026, 11, 2, 8, 0, 0).unwrap();
+        let next_day = Local.with_ymd_and_hms(2026, 11, 3, 8, 0, 0).unwrap();
+        assert!(sip.is_due_at(due));
+        assert!(!sip.is_due_at(next_day));
+        assert_eq!(sip.schedule_label(), "周一 08:00");
+    }
+
+    #[test]
+    fn sip_rejects_invalid_config() {
+        let sip = SipPlan {
+            enabled: true,
+            amount: 0.0,
+            frequency: SipFrequency::Monthly,
+            day: 32,
+            time: "25:00".into(),
+        };
+        assert!(sip.validate().is_err());
     }
 }

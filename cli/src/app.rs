@@ -66,6 +66,31 @@ pub async fn run_once(
         }
     }
 
+    if !report.sip_due.is_empty() {
+        let items = report
+            .sip_due
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} {}{:.2}（{}）",
+                    item.name,
+                    monitor::currency_symbol(&item.currency),
+                    item.amount,
+                    item.schedule
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        eprintln!("[costline] 今日定投提醒：{items}");
+        if report.sip_notify_success_count() == 0 {
+            if let Some(reason) = &report.sip_notify_skipped {
+                eprintln!("[costline] 定投提醒未发送：{reason}");
+            } else {
+                eprintln!("[costline] 定投提醒发送失败，下一轮会重试");
+            }
+        }
+    }
+
     if let Some(error) = report.fatal_error() {
         if !report.notify_results.is_empty() && report.notify_success_count() == 0
             || report.total > 0 && report.failures == report.total

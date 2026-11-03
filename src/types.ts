@@ -1,5 +1,23 @@
 export type AssetKind = "stock" | "fund" | "gold";
 
+export type SipFrequency = "weekly" | "monthly";
+
+export interface SipPlan {
+  enabled: boolean;
+  amount: number;
+  frequency: SipFrequency;
+  day: number;
+  time: string;
+}
+
+export interface SipInfo {
+  enabled: boolean;
+  amount: number;
+  schedule: string;
+  next_at: string | null;
+  due_today: boolean;
+}
+
 export interface Asset {
   kind: AssetKind;
   name?: string | null;
@@ -11,6 +29,7 @@ export interface Asset {
   principal?: number | null;
   threshold_percent?: number | null;
   target_price?: number | null;
+  sip?: SipPlan | null;
 }
 
 export type ChannelType =
@@ -74,6 +93,26 @@ export interface Row {
   above: boolean;
   triggered: boolean;
   note: string;
+  sip: SipInfo | null;
+}
+
+export interface SipReminder {
+  key: string;
+  name: string;
+  kind: string;
+  id: string;
+  amount: number;
+  currency: string;
+  price: number | null;
+  estimate_quantity: number | null;
+  schedule: string;
+  next_at: string | null;
+}
+
+export interface SipPayload {
+  title: string;
+  body: string;
+  reminders: SipReminder[];
 }
 
 export interface Snapshot {
@@ -84,6 +123,15 @@ export interface Snapshot {
   last_check: number | null;
   last_error: string | null;
   config_path: string;
+}
+
+export interface AssetSearchItem {
+  kind: AssetKind;
+  name: string;
+  code: string;
+  symbol: string | null;
+  secid: string | null;
+  market: string | null;
 }
 
 export interface AlertPayload {
