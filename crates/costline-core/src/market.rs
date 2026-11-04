@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Asset, AssetKind};
@@ -219,6 +219,46 @@ impl Quote {
             .filter(|prev| *prev > 0.0)
             .map(|prev| (self.price / prev - 1.0) * 100.0)
     }
+}
+
+/// 国内金价参照：上海黄金交易所 Au99.99（元/克）。
+pub const DOMESTIC_GOLD_SECID: &str = "118.AU9999";
+
+/// 黄金相关资产附带的国内金价，便于对照黄金基金 / 国际金价。
+#[derive(Debug, Clone, Serialize)]
+pub struct GoldReference {
+    pub price: f64,
+    pub change_percent: Option<f64>,
+    /// 例如「上海金 Au99.99（元/克）」
+    pub note: String,
+}
+
+/// 是否属于黄金相关品种：黄金本身，或名称含「黄金 / Gold / 金ETF」的基金、股票。
+pub fn is_gold_related(asset: &Asset, quote_name: Option<&str>) -> bool {
+    if asset.kind == AssetKind::Gold {
+        return true;
+    }
+    asset
+        .name
+        .as_deref()
+        .into_iter()
+        .chain(quote_name)
+        .any(mentions_gold)
+}
+
+fn mentions_gold(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("黄金") || lower.contains("gold") || lower.contains("金etf")
+}
+
+/// 获取国内金价（上海金 Au99.99，元/克）。
+pub async fn fetch_domestic_gold(client: &Client) -> Result<GoldReference> {
+    let quote = fetch_eastmoney(client, DOMESTIC_GOLD_SECID).await?;
+    Ok(GoldReference {
+        price: quote.price,
+        change_percent: quote.change_percent(),
+        note: "上海金 Au99.99（元/克）".to_string(),
+    })
 }
 
 pub async fn fetch_quote(client: &Client, asset: &Asset) -> Result<Quote> {
@@ -485,6 +525,186 @@ async fn fetch_danjuan_history(client: &Client, code: &str) -> Result<(f64, Stri
     Ok((nav, date))
 }
 
+/// 场外基金申购状态（天天基金基础信息接口）。
+///
+/// 会随状态文件一起持久化，用于在面板展示并在定投到期时判断能否买入。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FundTradeStatus {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// SGZT，例如「开放申购」「限大额」「暂停申购」
+    #[serde(default)]
+    pub subscribe_status: Option<String>,
+    /// SHZT，例如「开放赎回」「暂停赎回」
+    #[serde(default)]
+    pub redeem_status: Option<String>,
+    /// BUY，接口给出的布尔可买标记
+    #[serde(default)]
+    pub buy_enabled: Option<bool>,
+    /// ISBUY，1 表示可买，4 表示暂停申购
+    #[serde(default)]
+    pub buy_code: Option<i64>,
+    /// MINSG，最小申购金额
+    #[serde(default)]
+    pub min_amount: Option<f64>,
+    /// MAXSG，限额；已过滤 100000000000 这类“无上限”哨兵值
+    #[serde(default)]
+    pub max_amount: Option<f64>,
+    /// ISABNORMAL，基金状态是否异常
+    #[serde(default)]
+    pub abnormal: bool,
+    /// 状态查询时间（Unix 秒）
+    #[serde(default)]
+    pub checked_at: i64,
+    /// 最近一次查询失败的原因；成功时为空
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// 本期定投金额的申购判断结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscribeVerdict {
+    /// 可以正常申购
+    Open,
+    /// 暂停申购 / 封闭 / 超过限额
+    Blocked,
+    /// 接口没有返回足够的信息
+    Unknown,
+}
+
+impl FundTradeStatus {
+    /// 判断本期金额能否申购，返回 (结论, 说明)。
+    pub fn check_amount(&self, amount: f64) -> (SubscribeVerdict, Option<String>) {
+        let status = self.subscribe_status.as_deref().unwrap_or_default().trim();
+
+        if self.abnormal {
+            return (
+                SubscribeVerdict::Blocked,
+                Some("基金状态异常（ISABNORMAL）".to_string()),
+            );
+        }
+        if status.contains("暂停申购") || status.contains("封闭") {
+            return (SubscribeVerdict::Blocked, Some(status.to_string()));
+        }
+        if self.buy_enabled == Some(false) || self.buy_code == Some(4) {
+            let reason = if status.is_empty() {
+                "接口标记为不可申购".to_string()
+            } else {
+                status.to_string()
+            };
+            return (SubscribeVerdict::Blocked, Some(reason));
+        }
+        if let Some(min) = self.min_amount {
+            if amount < min {
+                return (
+                    SubscribeVerdict::Blocked,
+                    Some(format!("本期金额低于最小申购金额 {min:.2}")),
+                );
+            }
+        }
+        if status.contains("限大额") {
+            if let Some(max) = self.max_amount {
+                if amount > max {
+                    return (
+                        SubscribeVerdict::Blocked,
+                        Some(format!("限大额，单笔上限 {max:.2}")),
+                    );
+                }
+            }
+            if let Some(error) = &self.error {
+                return (
+                    SubscribeVerdict::Unknown,
+                    Some(format!("状态查询失败：{error}")),
+                );
+            }
+            return (SubscribeVerdict::Open, Some(status.to_string()));
+        }
+        if status.is_empty() && self.buy_enabled.is_none() && self.buy_code.is_none() {
+            let reason = self
+                .error
+                .clone()
+                .unwrap_or_else(|| "接口未返回申购状态".to_string());
+            return (SubscribeVerdict::Unknown, Some(reason));
+        }
+        // 有查询错误时，即使缓存里是“开放申购”也要求人工确认，避免误判。
+        if let Some(error) = &self.error {
+            return (
+                SubscribeVerdict::Unknown,
+                Some(format!("状态查询失败：{error}")),
+            );
+        }
+
+        let reason = if status.is_empty() {
+            "可申购".to_string()
+        } else {
+            status.to_string()
+        };
+        (SubscribeVerdict::Open, Some(reason))
+    }
+}
+
+/// 查询场外基金的申购状态。场内 ETF / LOF 不适用该接口。
+pub async fn fetch_fund_trade_status(client: &Client, code: &str) -> Result<FundTradeStatus> {
+    let code = code.trim();
+    if code.is_empty() {
+        bail!("基金代码不能为空");
+    }
+
+    let url = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNNBasicInformation";
+    let response = client
+        .get(url)
+        .query(&[
+            ("FCODE", code),
+            ("deviceid", "Wap"),
+            ("plat", "Wap"),
+            ("product", "EFund"),
+            ("version", "2.0.0"),
+        ])
+        .header("Referer", "https://fund.eastmoney.com/")
+        .send()
+        .await
+        .with_context(|| format!("请求基金 {code} 申购状态失败"))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("申购状态接口返回 HTTP {status}：{}", truncate(&body, 200));
+    }
+
+    let value: Value = serde_json::from_str(&body).context("解析基金申购状态 JSON 失败")?;
+    let ok = value
+        .get("ErrCode")
+        .map(|code| json_i64(Some(code)) == Some(0))
+        .unwrap_or(true);
+    if !ok {
+        bail!("申购状态接口返回错误：{}", truncate(&body, 200));
+    }
+    let data = value
+        .get("Datas")
+        .filter(|data| !data.is_null())
+        .ok_or_else(|| anyhow!("基金 {code} 没有返回申购状态"))?;
+
+    Ok(parse_fund_trade_status(data, code))
+}
+
+fn parse_fund_trade_status(data: &Value, fallback_code: &str) -> FundTradeStatus {
+    FundTradeStatus {
+        code: json_text(data.get("FCODE")).unwrap_or_else(|| fallback_code.to_string()),
+        name: json_text(data.get("SHORTNAME")),
+        subscribe_status: json_text(data.get("SGZT")),
+        redeem_status: json_text(data.get("SHZT")),
+        buy_enabled: json_bool(data.get("BUY")),
+        buy_code: json_i64(data.get("ISBUY")),
+        min_amount: json_number(data.get("MINSG")).filter(|value| *value > 0.0),
+        max_amount: json_number(data.get("MAXSG")).filter(|value| *value > 0.0 && *value < 1.0e11),
+        abnormal: json_i64(data.get("ISABNORMAL")) == Some(1),
+        checked_at: chrono::Utc::now().timestamp(),
+        error: None,
+    }
+}
+
 async fn fetch_sina_gold(client: &Client, symbol: &str) -> Result<Quote> {
     let url = format!("https://hq.sinajs.cn/list={symbol}");
     let response = client
@@ -696,6 +916,34 @@ fn json_number(value: Option<&Value>) -> Option<f64> {
     })
 }
 
+fn json_bool(value: Option<&Value>) -> Option<bool> {
+    value.and_then(|value| {
+        value.as_bool().or_else(|| {
+            value.as_str().and_then(|text| match text.trim() {
+                "true" | "True" | "1" => Some(true),
+                "false" | "False" | "0" => Some(false),
+                _ => None,
+            })
+        })
+    })
+}
+
+fn json_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    })
+}
+
+fn json_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && *text != "--")
+        .map(str::to_string)
+}
+
 fn extract_jsonp(body: &str) -> Option<&str> {
     let start = body.find('(')? + 1;
     let end = body.rfind(')')?;
@@ -749,6 +997,43 @@ mod tests {
     }
 
     #[test]
+    fn detects_gold_related_assets() {
+        let asset = |kind: AssetKind, name: Option<&str>| Asset {
+            kind,
+            name: name.map(str::to_string),
+            symbol: None,
+            secid: None,
+            code: None,
+            cost: None,
+            quantity: None,
+            principal: None,
+            as_of: None,
+            trades: Vec::new(),
+            threshold_percent: None,
+            target_price: None,
+            sip: None,
+        };
+
+        assert!(is_gold_related(&asset(AssetKind::Gold, None), None));
+        assert!(is_gold_related(
+            &asset(AssetKind::Fund, Some("华安黄金ETF联接A")),
+            None
+        ));
+        assert!(is_gold_related(
+            &asset(AssetKind::Fund, None),
+            Some("黄金ETF")
+        ));
+        assert!(is_gold_related(
+            &asset(AssetKind::Stock, Some("山东黄金")),
+            None
+        ));
+        assert!(!is_gold_related(
+            &asset(AssetKind::Fund, Some("招商中证白酒")),
+            Some("白酒基金")
+        ));
+    }
+
+    #[test]
     fn parses_fund_jsonp() {
         let body = r#"jsonpgz({"fundcode":"161725","name":"招商中证白酒","gsz":"0.6120"});"#;
         assert_eq!(
@@ -768,6 +1053,65 @@ mod tests {
         assert_eq!(currency_of_secid("116.00700"), "HKD");
         assert_eq!(currency_of_secid("105.AAPL"), "USD");
         assert_eq!(currency_of_secid("1.600000"), "CNY");
+    }
+
+    #[test]
+    fn detects_blocked_fund_status() {
+        let suspended = parse_fund_trade_status(
+            &serde_json::json!({
+                "FCODE": "501018",
+                "SGZT": "暂停申购",
+                "SHZT": "开放赎回",
+                "ISBUY": "4",
+                "BUY": false,
+                "MINSG": "10",
+                "MAXSG": "1"
+            }),
+            "501018",
+        );
+        assert_eq!(
+            suspended.check_amount(500.0),
+            (SubscribeVerdict::Blocked, Some("暂停申购".to_string()))
+        );
+
+        let limited = parse_fund_trade_status(
+            &serde_json::json!({
+                "FCODE": "161725",
+                "SGZT": "限大额",
+                "ISBUY": "1",
+                "BUY": true,
+                "MAXSG": "500000"
+            }),
+            "161725",
+        );
+        assert_eq!(limited.check_amount(500.0).0, SubscribeVerdict::Open);
+        assert_eq!(limited.check_amount(600000.0).0, SubscribeVerdict::Blocked);
+        assert_eq!(limited.max_amount, Some(500000.0));
+
+        let open = parse_fund_trade_status(
+            &serde_json::json!({
+                "FCODE": "001618",
+                "SGZT": "开放申购",
+                "ISBUY": "1",
+                "BUY": true,
+                "MINSG": "10",
+                "MAXSG": "100000000000"
+            }),
+            "001618",
+        );
+        assert_eq!(open.check_amount(500.0).0, SubscribeVerdict::Open);
+        assert_eq!(
+            open.check_amount(5.0).0,
+            SubscribeVerdict::Blocked,
+            "低于最小申购金额也应阻断"
+        );
+        assert_eq!(open.max_amount, None, "无上限哨兵值应被过滤");
+    }
+
+    #[test]
+    fn unknown_when_status_missing() {
+        let status = parse_fund_trade_status(&serde_json::json!({}), "000000");
+        assert_eq!(status.check_amount(100.0).0, SubscribeVerdict::Unknown);
     }
 
     #[test]

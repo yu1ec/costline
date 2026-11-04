@@ -284,6 +284,23 @@ export default function App() {
     }
   }
 
+  async function toggleRealtime() {
+    if (!snapshot) return;
+    setBusy(true);
+    try {
+      const next = await api.setRealtime(!snapshot.realtime);
+      setSnapshot(next);
+      setConfig((current) =>
+        current ? { ...current, realtime: next.realtime } : current,
+      );
+      showToast(next.realtime ? "实时价格已开启" : "实时价格已关闭");
+    } catch (error) {
+      showToast(errorMessage(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (disguise.mode === "full") {
     return (
       <DisguiseScreen
@@ -436,10 +453,15 @@ export default function App() {
             <span>
               {sipAlert.reminders
                 .slice(0, 3)
-                .map(
-                  (item) =>
-                    `${item.name} ${formatAmount(item.amount, item.currency)}`,
-                )
+                .map((item) => {
+                  const flag =
+                    item.status === "blocked"
+                      ? "⛔ "
+                      : item.status === "unknown"
+                        ? "⚠️ "
+                        : "";
+                  return `${flag}${item.name} ${formatAmount(item.amount, item.currency)}`;
+                })
                 .join(" · ")}
               {sipAlert.reminders.length > 3
                 ? ` · 等 ${sipAlert.reminders.length} 项`
@@ -489,6 +511,7 @@ export default function App() {
             busy={busy}
             hideAmounts={hideAmounts}
             onCheck={checkNow}
+            onToggleRealtime={toggleRealtime}
             onAddAsset={addAsset}
             onOpenSettings={() => setTab("settings")}
           />

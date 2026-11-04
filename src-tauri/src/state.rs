@@ -22,6 +22,7 @@ pub struct Runtime {
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub watching: bool,
+    pub realtime: bool,
     pub interval_secs: u64,
     pub assets_count: usize,
     pub rows: Vec<Row>,
@@ -51,6 +52,7 @@ impl AppState {
         let runtime = self.lock();
         Snapshot {
             watching: runtime.watching,
+            realtime: runtime.config.realtime,
             interval_secs: runtime.config.interval_secs,
             assets_count: runtime.config.assets.len(),
             rows: runtime.rows.clone(),

@@ -5,10 +5,30 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Trade;
+use crate::market::FundTradeStatus;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub assets: BTreeMap<String, AssetState>,
+    /// 从交割单导入的成交流水，按资产 key 分组。
+    ///
+    /// 与配置文件分开保存，自动导入时无需改写用户的 costline.toml。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trades: BTreeMap<String, Vec<Trade>>,
+    /// 已导入文件的指纹，避免每轮重复解析没有变化的交割单。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub imports: BTreeMap<String, ImportedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ImportedFile {
+    #[serde(default)]
+    pub len: u64,
+    /// 文件修改时间（Unix 秒）
+    #[serde(default)]
+    pub modified: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,6 +45,13 @@ pub struct AssetState {
     /// 最近一次发送定投提醒的日期（YYYY-MM-DD），用于同一天只提醒一次
     #[serde(default)]
     pub last_sip_notified: Option<String>,
+    /// 最近一次发送“定投受阻 / 状态未知”提醒的日期（YYYY-MM-DD）。
+    /// 与 last_sip_notified 分开记录：状态恢复开放后同一天仍会正常提醒。
+    #[serde(default)]
+    pub last_sip_blocked: Option<String>,
+    /// 最近一次查询到的基金申购状态
+    #[serde(default)]
+    pub trade_status: Option<FundTradeStatus>,
 }
 
 impl State {
@@ -36,6 +63,27 @@ impl State {
                 .or_default()
                 .last_sip_notified = Some(date.to_string());
         }
+    }
+
+    /// 记录“本期定投受阻”提醒已发送的日期。
+    pub fn mark_sip_blocked(&mut self, keys: &[String], date: &str) {
+        for key in keys {
+            self.assets.entry(key.clone()).or_default().last_sip_blocked = Some(date.to_string());
+        }
+    }
+
+    pub fn trades_for(&self, key: &str) -> &[Trade] {
+        self.trades.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn add_trade(&mut self, key: &str, trade: Trade) {
+        self.trades.entry(key.to_string()).or_default().push(trade);
+    }
+
+    pub fn has_trade(&self, key: &str, trade_key: &str) -> bool {
+        self.trades_for(key)
+            .iter()
+            .any(|trade| trade.key() == trade_key)
     }
 
     pub fn load(path: &Path) -> Self {

@@ -41,7 +41,7 @@ import { AssetModal } from "../components/AssetModal";
 import { ChannelModal } from "../components/ChannelModal";
 import { DisguiseSection } from "../components/DisguiseSection";
 import { UpdateSection } from "../components/UpdateSection";
-import { Field, NumberField, Tag } from "../components/ui";
+import { Field, NumberField, Tag, TextInput } from "../components/ui";
 
 type Toast = (text: string, tone?: "ok" | "error") => void;
 
@@ -314,6 +314,17 @@ export function Settings({
               value={global.repeat}
               placeholder="0"
               onChange={(value) => updateGlobal("repeat", value)}
+            />
+          </Field>
+          <Field
+            label="交割单目录"
+            hint="券商导出的 CSV / TXT 交割单放这里，卖出后自动按摊薄成本扣减本金"
+            className="span-2"
+          >
+            <TextInput
+              value={global.importDir}
+              placeholder="~/Documents/交割单"
+              onChange={(event) => updateGlobal("importDir", event.target.value)}
             />
           </Field>
         </div>

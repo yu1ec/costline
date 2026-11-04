@@ -12,6 +12,8 @@ export const api = {
   saveConfig: (config: Config) => invoke<Snapshot>("save_config", { config }),
   checkNow: () => invoke<Snapshot>("check_now"),
   setWatching: (watching: boolean) => invoke<Snapshot>("set_watching", { watching }),
+  setRealtime: (realtime: boolean) =>
+    invoke<Snapshot>("set_realtime", { realtime }),
   searchAssets: (keyword: string) =>
     invoke<AssetSearchItem[]>("search_assets", { keyword }),
   testNotify: (config: Config) => invoke<ChannelResult[]>("test_notify", { config }),

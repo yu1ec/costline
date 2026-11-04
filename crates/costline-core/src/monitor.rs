@@ -6,10 +6,36 @@ use chrono::{DateTime, Duration as ChronoDuration, Local};
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::config::Config;
-use crate::market;
+use crate::config::{Asset, AssetKind, Config};
+use crate::market::{self, FundTradeStatus, SubscribeVerdict};
 use crate::notify::{self, Notice};
+use crate::position::Position;
 use crate::state::State;
+
+/// 单期定投在提醒阶段的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SipPeriodStatus {
+    /// 申购状态正常，可以按计划买入
+    Ready,
+    /// 暂停申购 / 封闭 / 超过限额，本期不要买入
+    Blocked,
+    /// 无法确认申购状态，需要人工确认
+    Unknown,
+}
+
+/// 面板展示用的基金申购状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct SipTradeInfo {
+    /// 原始状态文案，例如「开放申购」「限大额」「暂停申购」
+    pub status: String,
+    /// 按本期金额判断是否受阻
+    pub blocked: bool,
+    pub max_amount: Option<f64>,
+    pub reason: Option<String>,
+    pub checked_at: i64,
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SipInfo {
@@ -21,6 +47,8 @@ pub struct SipInfo {
     pub next_at: Option<String>,
     /// 今天是否是定投日（且已到提醒时间）
     pub due_today: bool,
+    /// 基金申购状态（非基金或不适用时为空）
+    pub trade: Option<SipTradeInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,13 +59,23 @@ pub struct Row {
     pub id: String,
     pub price: f64,
     pub cost: Option<f64>,
-    pub target: f64,
+    /// 触发价；本金已收回或已清仓时为 None
+    pub target: Option<f64>,
     pub change_percent: Option<f64>,
     pub pnl: Option<f64>,
+    /// 摊薄后的剩余本金；未配置持仓数量时为 None
+    pub principal: Option<f64>,
+    pub quantity: Option<f64>,
     pub currency: &'static str,
     pub above: bool,
     pub triggered: bool,
+    /// 本金已全部收回（剩余本金 <= 0，仍有持仓）
+    pub recovered: bool,
+    /// 已清仓
+    pub closed: bool,
     pub note: String,
+    /// 国内金价参照（黄金及黄金基金、黄金股票显示）
+    pub gold_price: Option<market::GoldReference>,
     pub sip: Option<SipInfo>,
 }
 
@@ -55,6 +93,14 @@ pub struct SipReminder {
     pub estimate_quantity: Option<f64>,
     pub schedule: String,
     pub next_at: Option<String>,
+    /// 本期申购状态
+    pub status: SipPeriodStatus,
+    /// 阻断 / 未知状态的原因
+    pub reason: Option<String>,
+    /// 基金申购状态原文
+    pub trade_status: Option<String>,
+    /// 基金单笔申购上限
+    pub max_amount: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,28 +191,47 @@ pub async fn check(
     let today = local_now.format("%Y-%m-%d").to_string();
     let mut state = State::load(state_path);
     let mut alerts = Vec::new();
+    // 同一轮内只取一次国内金价；失败也缓存，避免每个黄金资产都重试。
+    let mut domestic_gold: Option<Option<market::GoldReference>> = None;
 
     for asset in &config.assets {
         match market::fetch_quote(client, asset).await {
             Ok(quote) => {
                 let key = asset.key();
                 let previous = state.assets.get(&key).cloned().unwrap_or_default();
-                let cost = asset.cost_price();
-                let Some(target) = asset.target_price(config.threshold_percent) else {
+                // 交割单导入的成交保存在状态文件里，与配置中的期初持仓一起计算。
+                let trades = state.trades_for(&key).to_vec();
+                let position = match Position::derive(asset, &trades) {
+                    Ok(position) => position,
+                    Err(error) => {
+                        report.failures += 1;
+                        report
+                            .errors
+                            .push(format!("{} 成交流水无效：{error:#}", asset.label()));
+                        continue;
+                    }
+                };
+                let cost = asset.cost_price_with(&trades);
+                let target = asset.target_price_with(config.threshold_percent, &trades);
+                if target.is_none() && !position.recovered && !position.closed {
                     report
                         .skipped
                         .push(format!("{} 缺少成本价或触发价，已跳过", asset.label()));
                     report.failures += 1;
                     continue;
-                };
+                }
 
-                let above = quote.price >= target;
+                let above = match target {
+                    Some(target) => quote.price >= target,
+                    None => position.recovered,
+                };
                 let cooldown_ok = previous.last_notified == 0
                     || now - previous.last_notified >= config.notify.cooldown_secs as i64;
                 let repeat_due = config.notify.repeat_interval_secs > 0
                     && previous.last_notified > 0
                     && now - previous.last_notified >= config.notify.repeat_interval_secs as i64;
-                let triggered = above
+                let triggered = target.is_some()
+                    && above
                     && (force_notify || !previous.above || repeat_due)
                     && (force_notify || cooldown_ok);
 
@@ -175,6 +240,20 @@ pub async fn check(
                     .clone()
                     .or_else(|| quote.name.clone())
                     .unwrap_or_else(|| asset.id());
+                let gold_price = if market::is_gold_related(asset, quote.name.as_deref()) {
+                    if domestic_gold.is_none() {
+                        domestic_gold = Some(match market::fetch_domestic_gold(client).await {
+                            Ok(gold) => Some(gold),
+                            Err(error) => {
+                                report.errors.push(format!("国内金价获取失败：{error:#}"));
+                                None
+                            }
+                        });
+                    }
+                    domestic_gold.clone().flatten()
+                } else {
+                    None
+                };
                 let row = Row {
                     key: key.clone(),
                     name: display_name,
@@ -184,14 +263,16 @@ pub async fn check(
                     cost,
                     target,
                     change_percent: quote.change_percent(),
-                    pnl: match (cost, asset.quantity) {
-                        (Some(cost), Some(quantity)) => Some((quote.price - cost) * quantity),
-                        _ => None,
-                    },
+                    pnl: position.market_pnl(quote.price),
+                    principal: position.has_position.then_some(position.principal),
+                    quantity: position.has_position.then_some(position.quantity),
                     currency: quote.currency,
                     above,
                     triggered,
+                    recovered: position.recovered,
+                    closed: position.closed,
                     note: quote.note.clone(),
+                    gold_price,
                     sip: asset.sip.as_ref().map(|sip| SipInfo {
                         enabled: sip.enabled,
                         amount: sip.amount,
@@ -200,6 +281,7 @@ pub async fn check(
                             .next_occurrence(local_now)
                             .map(|next| next.format("%Y-%m-%d %H:%M").to_string()),
                         due_today: sip.is_due_at(local_now),
+                        trade: None,
                     }),
                 };
 
@@ -222,6 +304,20 @@ pub async fn check(
                     .push(format!("{} 行情获取失败：{error:#}", asset.label()));
             }
         }
+    }
+
+    // 定投相关：先刷新申购状态，再补全面板展示并判断本期能否买入。
+    prepare_trade_statuses(config, client, &mut state, now, local_now).await;
+    for row in &mut report.rows {
+        let Some(sip) = row.sip.as_mut().filter(|sip| sip.enabled) else {
+            continue;
+        };
+        let trade = state
+            .assets
+            .get(&row.key)
+            .and_then(|entry| entry.trade_status.as_ref())
+            .map(|status| build_sip_trade_info(status, sip.amount));
+        sip.trade = trade;
     }
 
     report.triggered = alerts.clone();
@@ -293,8 +389,18 @@ pub async fn check(
                 });
             }
             if any_success {
-                let keys: Vec<String> = sip_due.iter().map(|item| item.key.clone()).collect();
-                state.mark_sip_notified(&keys, &today);
+                let ready: Vec<String> = sip_due
+                    .iter()
+                    .filter(|item| item.status == SipPeriodStatus::Ready)
+                    .map(|item| item.key.clone())
+                    .collect();
+                let warned: Vec<String> = sip_due
+                    .iter()
+                    .filter(|item| item.status != SipPeriodStatus::Ready)
+                    .map(|item| item.key.clone())
+                    .collect();
+                state.mark_sip_notified(&ready, &today);
+                state.mark_sip_blocked(&warned, &today);
             }
         }
         report.sip_due = sip_due;
@@ -323,11 +429,18 @@ fn collect_sip_due(
                 return None;
             }
             let key = asset.key();
-            if state
-                .assets
-                .get(&key)
-                .and_then(|entry| entry.last_sip_notified.as_deref())
-                == Some(today)
+            let entry = state.assets.get(&key);
+            if entry.and_then(|entry| entry.last_sip_notified.as_deref()) == Some(today) {
+                return None;
+            }
+
+            let (status, reason, trade_status, max_amount) = evaluate_sip_status(
+                asset,
+                sip.amount,
+                entry.and_then(|e| e.trade_status.as_ref()),
+            );
+            if status != SipPeriodStatus::Ready
+                && entry.and_then(|entry| entry.last_sip_blocked.as_deref()) == Some(today)
             {
                 return None;
             }
@@ -353,9 +466,121 @@ fn collect_sip_due(
                 next_at: sip
                     .next_occurrence(now + ChronoDuration::minutes(1))
                     .map(|next| next.format("%Y-%m-%d %H:%M").to_string()),
+                status,
+                reason,
+                trade_status,
+                max_amount,
             })
         })
         .collect()
+}
+
+/// 场外基金代码；股票、黄金、场内基金返回 None（不适用申购状态接口）。
+fn otc_fund_code(asset: &Asset) -> Option<&str> {
+    if asset.kind != AssetKind::Fund {
+        return None;
+    }
+    let code = asset.code.as_deref().or(asset.symbol.as_deref())?;
+    if market::is_exchange_fund(code) {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+/// 判断本期定投能否买入，返回 (状态, 原因, 原始申购状态, 单笔上限)。
+fn evaluate_sip_status(
+    asset: &Asset,
+    amount: f64,
+    trade: Option<&FundTradeStatus>,
+) -> (SipPeriodStatus, Option<String>, Option<String>, Option<f64>) {
+    if otc_fund_code(asset).is_none() {
+        return (SipPeriodStatus::Ready, None, None, None);
+    }
+    let Some(trade) = trade else {
+        return (
+            SipPeriodStatus::Unknown,
+            Some("尚未查询到申购状态".to_string()),
+            None,
+            None,
+        );
+    };
+
+    let (verdict, reason) = trade.check_amount(amount);
+    let status = match verdict {
+        SubscribeVerdict::Open => SipPeriodStatus::Ready,
+        SubscribeVerdict::Blocked => SipPeriodStatus::Blocked,
+        SubscribeVerdict::Unknown => SipPeriodStatus::Unknown,
+    };
+    (
+        status,
+        reason,
+        trade.subscribe_status.clone(),
+        trade.max_amount,
+    )
+}
+
+fn build_sip_trade_info(status: &FundTradeStatus, amount: f64) -> SipTradeInfo {
+    let (verdict, reason) = status.check_amount(amount);
+    SipTradeInfo {
+        status: status
+            .subscribe_status
+            .clone()
+            .unwrap_or_else(|| "未确认".to_string()),
+        blocked: verdict == SubscribeVerdict::Blocked,
+        max_amount: status.max_amount,
+        reason: reason.or_else(|| status.error.clone()),
+        checked_at: status.checked_at,
+        error: status.error.clone(),
+    }
+}
+
+/// 刷新定投基金的申购状态；同一个 TTL 内复用缓存，失败时保留上一次结果并记录错误。
+async fn prepare_trade_statuses(
+    config: &Config,
+    client: &Client,
+    state: &mut State,
+    now: i64,
+    local_now: DateTime<Local>,
+) {
+    for asset in &config.assets {
+        let Some(sip) = asset.sip.as_ref().filter(|sip| sip.enabled) else {
+            continue;
+        };
+        let Some(code) = otc_fund_code(asset) else {
+            continue;
+        };
+
+        let key = asset.key();
+        let cached = state
+            .assets
+            .get(&key)
+            .and_then(|entry| entry.trade_status.clone());
+        // 定投日状态可能临时变化，缩短缓存；其他时间一天查询几次即可。
+        let ttl = if sip.is_sip_day(local_now) {
+            15 * 60
+        } else {
+            6 * 3600
+        };
+        if cached
+            .as_ref()
+            .is_some_and(|cache| now >= cache.checked_at && now - cache.checked_at < ttl)
+        {
+            continue;
+        }
+
+        match market::fetch_fund_trade_status(client, code).await {
+            Ok(status) => {
+                state.assets.entry(key).or_default().trade_status = Some(status);
+            }
+            Err(error) => {
+                let mut fallback = cached.unwrap_or_default();
+                fallback.error = Some(format!("{error:#}"));
+                fallback.checked_at = now;
+                state.assets.entry(key).or_default().trade_status = Some(fallback);
+            }
+        }
+    }
 }
 
 pub fn test_notice() -> Notice {
@@ -386,14 +611,24 @@ pub fn build_notice(alerts: &[Row]) -> Notice {
     for row in alerts {
         lines.push(format!("📈 {}（{}）", row.name, row.id));
         let cost_text = row.cost.map(fmt_price).unwrap_or_else(|| "-".to_string());
+        let target_text = row.target.map(fmt_price).unwrap_or_else(|| "-".to_string());
         lines.push(format!(
             "现价 {} ｜ 成本 {} ｜ 触发价 {}",
             fmt_price(row.price),
             cost_text,
-            fmt_price(row.target)
+            target_text
         ));
         if let Some(change) = row.change_percent {
             lines.push(format!("日涨跌 {}", fmt_percent(Some(change))));
+        }
+        if let Some(gold) = &row.gold_price {
+            lines.push(format!(
+                "国内金价 {} 元/克{}",
+                fmt_price(gold.price),
+                gold.change_percent
+                    .map(|change| format!("（{}）", fmt_percent(Some(change))))
+                    .unwrap_or_default()
+            ));
         }
         if let Some(pnl) = row.pnl {
             lines.push(format!(
@@ -416,8 +651,24 @@ pub fn build_notice(alerts: &[Row]) -> Notice {
 }
 
 pub fn build_sip_notice(reminders: &[SipReminder]) -> Notice {
-    let title = if reminders.len() == 1 {
+    let blocked = reminders
+        .iter()
+        .filter(|item| item.status == SipPeriodStatus::Blocked)
+        .count();
+    let unknown = reminders
+        .iter()
+        .filter(|item| item.status == SipPeriodStatus::Unknown)
+        .count();
+    let title = if blocked == reminders.len() {
+        format!("costline 定投阻断提醒（{} 项）", reminders.len())
+    } else if reminders.len() == 1 {
         format!("costline 定投提醒：{}", reminders[0].name)
+    } else if blocked + unknown > 0 {
+        format!(
+            "costline 定投提醒（{} 项，{} 项需确认）",
+            reminders.len(),
+            blocked + unknown
+        )
     } else {
         format!("costline 定投提醒（{} 项）", reminders.len())
     };
@@ -427,11 +678,16 @@ pub fn build_sip_notice(reminders: &[SipReminder]) -> Notice {
         "时间：{}",
         Local::now().format("%Y-%m-%d %H:%M:%S")
     ));
-    lines.push("定投日到了，记得按计划买入：".to_string());
+    lines.push("定投日到了，请按计划处理：".to_string());
     lines.push(String::new());
 
     for item in reminders {
-        lines.push(format!("📥 {}（{}）", item.name, item.id));
+        let icon = match item.status {
+            SipPeriodStatus::Ready => "📥",
+            SipPeriodStatus::Blocked => "⛔",
+            SipPeriodStatus::Unknown => "⚠️",
+        };
+        lines.push(format!("{icon} {}（{}）", item.name, item.id));
         lines.push(format!(
             "本期金额 {}{:.2}（{}）",
             currency_symbol(&item.currency),
@@ -439,13 +695,40 @@ pub fn build_sip_notice(reminders: &[SipReminder]) -> Notice {
             item.currency
         ));
         lines.push(format!("定投计划 {}", item.schedule));
-        if let Some(price) = item.price {
-            let estimate = item
-                .estimate_quantity
-                .map(|quantity| format!("，约 {quantity:.2} 份/股"))
-                .unwrap_or_default();
-            lines.push(format!("当前价 {}{estimate}", fmt_price(price)));
+
+        match item.status {
+            SipPeriodStatus::Blocked => {
+                if let Some(reason) = &item.reason {
+                    lines.push(format!("阻断原因：{reason}"));
+                }
+                lines.push("本期资金未计入持仓，请勿买入".to_string());
+            }
+            SipPeriodStatus::Unknown => {
+                if let Some(reason) = &item.reason {
+                    lines.push(format!("状态未知：{reason}"));
+                }
+                lines.push("请先确认基金能否申购，再决定是否买入".to_string());
+            }
+            SipPeriodStatus::Ready => {
+                if let Some(status) = &item.trade_status {
+                    let limit = item
+                        .max_amount
+                        .map(|max| {
+                            format!("，单笔上限 {}{:.2}", currency_symbol(&item.currency), max)
+                        })
+                        .unwrap_or_default();
+                    lines.push(format!("申购状态 {status}{limit}"));
+                }
+                if let Some(price) = item.price {
+                    let estimate = item
+                        .estimate_quantity
+                        .map(|quantity| format!("，约 {quantity:.2} 份/股"))
+                        .unwrap_or_default();
+                    lines.push(format!("当前价 {}{estimate}", fmt_price(price)));
+                }
+            }
         }
+
         if let Some(next) = &item.next_at {
             lines.push(format!("下次定投 {next}"));
         }
@@ -514,13 +797,18 @@ mod tests {
             id: "1.600000".to_string(),
             price: 10.5,
             cost: Some(10.0),
-            target: 10.0,
+            target: Some(10.0),
             change_percent: Some(1.2),
             pnl: Some(500.0),
+            principal: Some(10000.0),
+            quantity: Some(1000.0),
             currency: "CNY",
             above: true,
             triggered: true,
+            recovered: false,
+            closed: false,
             note: "东方财富实时".to_string(),
+            gold_price: None,
             sip: None,
         };
         let notice = build_notice(&[row]);
@@ -541,10 +829,39 @@ mod tests {
             estimate_quantity: Some(833.33),
             schedule: "每月 1 日 09:30".to_string(),
             next_at: Some("2026-12-01 09:30".to_string()),
+            status: SipPeriodStatus::Ready,
+            reason: None,
+            trade_status: Some("限大额".to_string()),
+            max_amount: Some(500000.0),
         };
         let notice = build_sip_notice(&[reminder]);
         assert!(notice.title.contains("招商中证白酒"));
         assert!(notice.body.contains("¥500.00"));
         assert!(notice.body.contains("每月 1 日 09:30"));
+        assert!(notice.body.contains("限大额"));
+    }
+
+    #[test]
+    fn builds_blocked_sip_notice() {
+        let reminder = SipReminder {
+            key: "fund:501018".to_string(),
+            name: "南方原油A".to_string(),
+            kind: "基金",
+            id: "501018".to_string(),
+            amount: 500.0,
+            currency: "CNY".to_string(),
+            price: None,
+            estimate_quantity: None,
+            schedule: "每月 1 日 09:30".to_string(),
+            next_at: None,
+            status: SipPeriodStatus::Blocked,
+            reason: Some("暂停申购".to_string()),
+            trade_status: Some("暂停申购".to_string()),
+            max_amount: None,
+        };
+        let notice = build_sip_notice(&[reminder]);
+        assert!(notice.title.contains("阻断"));
+        assert!(notice.body.contains("阻断原因：暂停申购"));
+        assert!(notice.body.contains("本期资金未计入持仓"));
     }
 }

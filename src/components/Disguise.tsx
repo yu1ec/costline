@@ -967,7 +967,7 @@ function FinanceSheet({ rows, onExit }: { rows: Row[]; onExit: () => void }) {
   const peek = usePeek();
   const currencies = new Set(rows.map((row) => row.currency));
   const singleCurrency = rows.length > 0 && currencies.size === 1;
-  const totalBudget = rows.reduce((sum, row) => sum + row.target, 0);
+  const totalBudget = rows.reduce((sum, row) => sum + (row.target ?? 0), 0);
   const totalActual = rows.reduce((sum, row) => sum + row.price, 0);
   const totalRatio =
     totalBudget > 0 ? `${((totalActual / totalBudget) * 100).toFixed(1)}%` : "—";
@@ -975,7 +975,8 @@ function FinanceSheet({ rows, onExit }: { rows: Row[]; onExit: () => void }) {
   const avgRatio = rows.length
     ? `${(
         (rows.reduce(
-          (sum, row) => sum + (row.target > 0 ? row.price / row.target : 1),
+          (sum, row) =>
+            sum + ((row.target ?? 0) > 0 ? row.price / (row.target ?? 1) : 1),
           0,
         ) /
           rows.length) *
@@ -1044,15 +1045,16 @@ function FinanceSheet({ rows, onExit }: { rows: Row[]; onExit: () => void }) {
             ) : (
               rows.map((row, index) => {
                 const status = statusOf(row, "finance");
+                const target = row.target ?? 0;
                 const ratio =
-                  row.target > 0
-                    ? `${((row.price / row.target) * 100).toFixed(1)}%`
+                  target > 0
+                    ? `${((row.price / target) * 100).toFixed(1)}%`
                     : "—";
                 return (
                   <tr key={row.key}>
                     <th>{index + 1}</th>
                     <td>{peek ? row.name : personaAlias("finance", index)}</td>
-                    <td className="fn-num">{formatAmount(row.target)}</td>
+                    <td className="fn-num">{formatAmount(row.target ?? 0)}</td>
                     <td className="fn-num">{formatAmount(row.price)}</td>
                     <td className="fn-num">{ratio}</td>
                     <td className={`fn-num ${changeTone(row.change_percent)}`}>

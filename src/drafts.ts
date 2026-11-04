@@ -5,6 +5,7 @@ import type {
   ChannelType,
   Config,
   SipFrequency,
+  Trade,
 } from "./types";
 
 export interface GlobalDraft {
@@ -13,6 +14,8 @@ export interface GlobalDraft {
   threshold: string;
   cooldown: string;
   repeat: string;
+  importDir: string;
+  realtime: boolean;
 }
 
 export interface AssetDraft {
@@ -24,6 +27,8 @@ export interface AssetDraft {
   cost: string;
   quantity: string;
   principal: string;
+  asOf: string;
+  trades: Trade[];
   threshold: string;
   target: string;
   sipEnabled: boolean;
@@ -126,6 +131,8 @@ export function assetToDraft(asset: Asset): AssetDraft {
     cost: numberText(asset.cost),
     quantity: numberText(asset.quantity),
     principal: numberText(asset.principal),
+    asOf: text(asset.as_of),
+    trades: asset.trades ?? [],
     threshold: numberText(asset.threshold_percent),
     target: numberText(asset.target_price),
     sipEnabled: asset.sip?.enabled ?? false,
@@ -146,6 +153,8 @@ export function emptyAssetDraft(kind: AssetKind = "stock"): AssetDraft {
     cost: "",
     quantity: "",
     principal: "",
+    asOf: "",
+    trades: [],
     threshold: "",
     target: "",
     sipEnabled: false,
@@ -178,6 +187,9 @@ export function draftToAsset(draft: AssetDraft): Asset {
   if (quantity != null) asset.quantity = quantity;
   const principal = parseNumber(draft.principal);
   if (principal != null) asset.principal = principal;
+  const asOf = draft.asOf.trim();
+  if (asOf) asset.as_of = asOf;
+  if (draft.trades.length > 0) asset.trades = draft.trades;
   const threshold = parseNumber(draft.threshold);
   if (threshold != null) asset.threshold_percent = threshold;
   const target = parseNumber(draft.target);
@@ -517,6 +529,8 @@ export function configToDraft(config: Config): ConfigDraft {
       threshold: String(config.threshold_percent),
       cooldown: String(config.notify.cooldown_secs),
       repeat: String(config.notify.repeat_interval_secs),
+      importDir: config.import?.dir ?? "",
+      realtime: config.realtime ?? false,
     },
     assets: config.assets.map(assetToDraft),
     channels: config.notify.channels.map(channelToDraft),
@@ -528,11 +542,15 @@ export function draftToConfig(draft: ConfigDraft): Config {
     interval_secs: intOr(draft.global.interval, 60),
     timeout_secs: intOr(draft.global.timeout, 10),
     threshold_percent: parseNumber(draft.global.threshold) ?? 0,
+    realtime: draft.global.realtime,
     notify: {
       cooldown_secs: intOr(draft.global.cooldown, 1800),
       repeat_interval_secs: intOr(draft.global.repeat, 0),
       channels: draft.channels.map(draftToChannel),
     },
+    import: draft.global.importDir.trim()
+      ? { dir: draft.global.importDir.trim() }
+      : undefined,
     assets: draft.assets.map(draftToAsset),
   };
 }

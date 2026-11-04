@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use chrono::Local;
-use costline_core::{config, monitor, monitor::Row};
+use costline_core::{config, delivery, monitor, monitor::Row};
 use reqwest::Client;
 
 pub async fn run_once(
@@ -71,8 +71,13 @@ pub async fn run_once(
             .sip_due
             .iter()
             .map(|item| {
+                let flag = match item.status {
+                    monitor::SipPeriodStatus::Ready => "",
+                    monitor::SipPeriodStatus::Blocked => " [阻断]",
+                    monitor::SipPeriodStatus::Unknown => " [状态未知]",
+                };
                 format!(
-                    "{} {}{:.2}（{}）",
+                    "{} {}{:.2}（{}）{flag}",
                     item.name,
                     monitor::currency_symbol(&item.currency),
                     item.amount,
@@ -105,6 +110,7 @@ pub async fn watch(config_path: &Path, state_path: &Path, notify_enabled: bool) 
     let mut config = config::load(config_path)?;
     let mut client = monitor::build_client(&config)?;
     let mut timeout_secs = config.timeout_secs;
+    let mut last_import_errors: Vec<String> = Vec::new();
 
     println!(
         "[costline] 开始盯盘，每 {} 秒检查一次，按 Ctrl+C 退出",
@@ -112,13 +118,27 @@ pub async fn watch(config_path: &Path, state_path: &Path, notify_enabled: bool) 
     );
 
     loop {
-        match config::load(config_path) {
-            Ok(new_config) => {
-                if new_config.timeout_secs != timeout_secs {
-                    client = monitor::build_client(&new_config)?;
-                    timeout_secs = new_config.timeout_secs;
+        match delivery::sync(config_path, state_path, None, false) {
+            Ok(outcome) => {
+                let report = &outcome.report;
+                if report.files > 0 || report.added > 0 || !report.warnings.is_empty() {
+                    eprintln!("[costline] 交割单：{}", report.summary());
+                    for warning in &report.warnings {
+                        eprintln!("[costline] 交割单提示：{warning}");
+                    }
                 }
-                config = new_config;
+                // 目录不存在 / 为空时每轮结果相同，只在变化时提示一次。
+                if report.errors != last_import_errors {
+                    for error in &report.errors {
+                        eprintln!("[costline] 交割单错误：{error}");
+                    }
+                    last_import_errors = report.errors.clone();
+                }
+                if outcome.config.timeout_secs != timeout_secs {
+                    client = monitor::build_client(&outcome.config)?;
+                    timeout_secs = outcome.config.timeout_secs;
+                }
+                config = outcome.config;
             }
             Err(error) => {
                 eprintln!("[costline] 重新加载配置失败，继续使用旧配置：{error:#}");
@@ -176,6 +196,10 @@ fn print_table(rows: &[Row]) {
     for row in rows {
         let signal = if row.triggered {
             "🔔 提醒"
+        } else if row.closed {
+            "已清仓"
+        } else if row.recovered {
+            "本金收回"
         } else if row.above {
             "✅ 回本"
         } else {
@@ -184,6 +208,10 @@ fn print_table(rows: &[Row]) {
         let pnl = row
             .pnl
             .map(|value| monitor::fmt_signed_money(value, row.currency))
+            .unwrap_or_else(|| "-".to_string());
+        let target = row
+            .target
+            .map(monitor::fmt_price)
             .unwrap_or_else(|| "-".to_string());
         println!(
             "{} {} {} {} {} {} {} {} {} {}",
@@ -197,12 +225,21 @@ fn print_table(rows: &[Row]) {
                     .unwrap_or_else(|| "-".to_string()),
                 10
             ),
-            pad_left(&monitor::fmt_price(row.target), 10),
+            pad_left(&target, 10),
             pad_left(&monitor::fmt_percent(row.change_percent), 8),
             pad_left(&pnl, 14),
             pad_right(signal, 8),
             truncate_display(&row.note, 16)
         );
+        if let Some(gold) = &row.gold_price {
+            println!(
+                "    ↳ 国内金价 {} 元/克{}",
+                monitor::fmt_price(gold.price),
+                gold.change_percent
+                    .map(|change| format!("（{}）", monitor::fmt_percent(Some(change))))
+                    .unwrap_or_default()
+            );
+        }
     }
 }
 

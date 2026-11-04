@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use costline_core::{config, monitor};
+use costline_core::{config, delivery, monitor};
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +51,14 @@ enum Command {
         #[arg(long)]
         no_notify: bool,
     },
+    /// 导入券商交割单（CSV / TXT）
+    Import {
+        /// 交割单文件或目录；省略时使用配置中的 import.dir
+        path: Option<PathBuf>,
+        /// 忽略文件缓存，重新解析（已导入的成交仍会自动去重）
+        #[arg(long)]
+        force: bool,
+    },
     /// 发送一条测试通知
     TestNotify,
 }
@@ -60,6 +68,21 @@ async fn main() {
     if let Err(error) = run().await {
         eprintln!("错误：{error:#}");
         std::process::exit(1);
+    }
+}
+
+fn print_import(report: &delivery::ImportReport) {
+    if report.is_empty() {
+        return;
+    }
+    if report.files > 0 || report.added > 0 {
+        eprintln!("[costline] 交割单：{}", report.summary());
+    }
+    for warning in &report.warnings {
+        eprintln!("[costline] 交割单提示：{warning}");
+    }
+    for error in &report.errors {
+        eprintln!("[costline] 交割单错误：{error}");
     }
 }
 
@@ -91,7 +114,9 @@ async fn run() -> Result<()> {
             json,
             force_notify,
         } => {
-            let config = config::load(&config_path)?;
+            let outcome = delivery::sync(&config_path, &state_path, None, false)?;
+            print_import(&outcome.report);
+            let config = outcome.config;
             let client = monitor::build_client(&config)?;
             app::run_once(
                 &config,
@@ -104,6 +129,26 @@ async fn run() -> Result<()> {
             .await
         }
         Command::Watch { no_notify } => app::watch(&config_path, &state_path, !no_notify).await,
+        Command::Import { path, force } => {
+            let outcome = delivery::sync(&config_path, &state_path, path.as_deref(), force)?;
+            if path.is_none() && outcome.config.import.dir().is_none() {
+                bail!(
+                    "没有配置交割单目录。请在 {} 中添加 [import] dir = \"...\"，或执行 costline import <文件/目录>",
+                    config_path.display()
+                );
+            }
+            println!("交割单导入：{}", outcome.report.summary());
+            for warning in &outcome.report.warnings {
+                eprintln!("[costline] 交割单提示：{warning}");
+            }
+            for error in &outcome.report.errors {
+                eprintln!("[costline] 交割单错误：{error}");
+            }
+            if outcome.report.files == 0 && !outcome.report.errors.is_empty() {
+                bail!("交割单导入失败");
+            }
+            Ok(())
+        }
         Command::TestNotify => {
             let config = config::load(&config_path)?;
             if config.notify.channels.is_empty() {

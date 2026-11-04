@@ -61,6 +61,33 @@ pub async fn set_watching(app: AppHandle, watching: bool) -> Snapshot {
 }
 
 #[tauri::command]
+pub fn set_realtime(app: AppHandle, realtime: bool) -> Result<Snapshot, String> {
+    let snapshot = {
+        let state = app.state::<AppState>();
+        {
+            let mut runtime = state.lock();
+            let mut config = runtime.config.clone();
+            config.realtime = realtime;
+            config::save(&state.config_path, &config).map_err(|error| format!("{error:#}"))?;
+            runtime.config = config;
+            runtime.last_error = None;
+        }
+        state.snapshot()
+    };
+    let _ = app.emit("snapshot", &snapshot);
+
+    // 开启后立刻刷新一轮，避免等待下一个周期。
+    if realtime {
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            watcher::run_price_refresh(&handle).await;
+        });
+    }
+
+    Ok(snapshot)
+}
+
+#[tauri::command]
 pub async fn search_assets(
     state: State<'_, AppState>,
     keyword: String,
@@ -126,10 +153,12 @@ pub async fn test_notify(app: AppHandle, config: Config) -> Result<Vec<ChannelRe
 #[tauri::command]
 pub fn reset_state(app: AppHandle) -> Result<Snapshot, String> {
     let state = app.state::<AppState>();
-    if state.state_path.exists() {
-        std::fs::remove_file(&state.state_path)
-            .map_err(|error| format!("删除状态文件失败：{error}"))?;
-    }
+    // 只清空提醒状态；交割单导入的成交流水和文件缓存必须保留。
+    let mut saved = costline_core::State::load(&state.state_path);
+    saved.assets.clear();
+    saved
+        .save(&state.state_path)
+        .map_err(|error| format!("重置状态失败：{error:#}"))?;
     let snapshot = state.snapshot();
     let _ = app.emit("snapshot", &snapshot);
     Ok(snapshot)

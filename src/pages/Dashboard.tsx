@@ -30,6 +30,7 @@ export function Dashboard({
   busy,
   hideAmounts,
   onCheck,
+  onToggleRealtime,
   onAddAsset,
   onOpenSettings,
 }: {
@@ -38,6 +39,7 @@ export function Dashboard({
   busy: boolean;
   hideAmounts: boolean;
   onCheck: () => void;
+  onToggleRealtime: () => void;
   onAddAsset: (draft: AssetDraft) => Promise<boolean>;
   onOpenSettings: () => void;
 }) {
@@ -129,12 +131,30 @@ export function Dashboard({
             <p>
               {snapshot?.watching ? "自动盯盘进行中" : "自动盯盘已暂停"}
               <span className="dot">·</span>
+              {snapshot?.realtime ? "实时价格刷新中" : "实时价格已关闭"}
+              <span className="dot">·</span>
               最近检查 {formatTime(snapshot?.last_check ?? null)}
               <span className="dot">·</span>
               每 {snapshot?.interval_secs ?? config?.interval_secs ?? 60} 秒刷新
             </p>
           </div>
           <div className="panel-actions">
+            <label
+              className="realtime-switch"
+              title="开启后每 10 秒刷新一次基金、黄金和股票的行情"
+            >
+              <input
+                type="checkbox"
+                checked={Boolean(snapshot?.realtime)}
+                disabled={busy}
+                onChange={onToggleRealtime}
+              />
+              <span className="realtime-switch-track" aria-hidden />
+              <span className="realtime-switch-text">
+                <strong>实时价格</strong>
+                <em>{snapshot?.realtime ? "每 10 秒刷新" : "已关闭"}</em>
+              </span>
+            </label>
             <button
               type="button"
               className="btn primary"
@@ -187,6 +207,18 @@ export function Dashboard({
                     {row.id}
                     {row.note ? ` · ${row.note}` : ""}
                   </span>
+                  {row.gold_price ? (
+                    <span className="asset-gold" title={row.gold_price.note}>
+                      国内金价{" "}
+                      <span className="mono">
+                        {formatPrice(row.gold_price.price)}
+                      </span>{" "}
+                      元/克
+                      {row.gold_price.change_percent != null
+                        ? ` · ${formatPercent(row.gold_price.change_percent)}`
+                        : ""}
+                    </span>
+                  ) : null}
                   {row.sip?.enabled ? (
                     <span
                       className={row.sip.due_today ? "asset-sip due" : "asset-sip"}
@@ -201,6 +233,26 @@ export function Dashboard({
                         : row.sip.next_at
                           ? ` · 下次 ${formatSipDate(row.sip.next_at)}`
                           : ""}
+                    </span>
+                  ) : null}
+                  {row.sip?.enabled && row.sip.trade ? (
+                    <span
+                      className={
+                        row.sip.trade.blocked
+                          ? "asset-sip trade blocked"
+                          : "asset-sip trade"
+                      }
+                      title={row.sip.trade.reason ?? undefined}
+                    >
+                      申购状态 {row.sip.trade.status}
+                      {row.sip.trade.max_amount != null
+                        ? ` · 上限 ${formatAmount(
+                            row.sip.trade.max_amount,
+                            row.currency,
+                          )}`
+                        : ""}
+                      {row.sip.trade.blocked ? " · 本期不买入" : ""}
+                      {row.sip.trade.error ? " · 状态查询失败" : ""}
                     </span>
                   ) : null}
                 </div>
@@ -218,6 +270,16 @@ export function Dashboard({
                       {hideAmounts ? REDACTED : formatPrice(row.target)}
                     </span>
                   </span>
+                  {row.principal != null ? (
+                    <span className="cell-sub">
+                      剩余本金{" "}
+                      <span className="mono">
+                        {hideAmounts
+                          ? REDACTED
+                          : formatMoney(row.principal, row.currency)}
+                      </span>
+                    </span>
+                  ) : null}
                 </div>
                 <div className="cell">
                   <span
@@ -246,6 +308,10 @@ export function Dashboard({
                 <div className="cell">
                   {row.triggered ? (
                     <Tag tone="warn">已触发</Tag>
+                  ) : row.closed ? (
+                    <Tag>已清仓</Tag>
+                  ) : row.recovered ? (
+                    <Tag tone="ok">本金已收回</Tag>
                   ) : row.above ? (
                     <Tag tone="ok">已回本</Tag>
                   ) : (

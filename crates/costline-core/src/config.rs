@@ -20,10 +20,40 @@ pub struct Config {
     /// 全局回本阈值：现价 >= 成本价 * (1 + threshold_percent / 100)
     #[serde(default)]
     pub threshold_percent: f64,
+    /// 实时价格：开启后以较短间隔单独刷新行情，不改变通知节奏
+    #[serde(default)]
+    pub realtime: bool,
     #[serde(default)]
     pub notify: NotifyConfig,
+    /// 交割单自动导入配置
+    #[serde(default, skip_serializing_if = "ImportConfig::is_empty")]
+    pub import: ImportConfig,
     #[serde(default)]
     pub assets: Vec<Asset>,
+}
+
+/// 交割单自动导入。
+///
+/// 目录中放券商导出的 CSV / TXT 交割单，每次盯盘前扫描一次；
+/// 新成交会追加到对应资产的 `trades`，重复文件与重复成交自动忽略。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportConfig {
+    /// 交割单目录，支持 `~`；留空则不自动导入
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
+
+impl ImportConfig {
+    pub fn is_empty(&self) -> bool {
+        self.dir.as_deref().map(str::trim).unwrap_or("").is_empty()
+    }
+
+    pub fn dir(&self) -> Option<&str> {
+        self.dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +84,9 @@ impl Default for Config {
             interval_secs: default_interval(),
             timeout_secs: default_timeout(),
             threshold_percent: 0.0,
+            realtime: false,
             notify: NotifyConfig::default(),
+            import: ImportConfig::default(),
             assets: Vec::new(),
         }
     }
@@ -144,6 +176,19 @@ impl SipPlan {
         }
     }
 
+    /// 今天是否为定投日（不看提醒时间）。
+    pub fn is_sip_day(&self, now: DateTime<Local>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.frequency {
+            SipFrequency::Weekly => now.weekday().num_days_from_monday() + 1 == self.day as u32,
+            SipFrequency::Monthly => {
+                now.day() == self.day.min(last_day_of_month(now.year(), now.month())) as u32
+            }
+        }
+    }
+
     /// 今天是否为定投日，且提醒时间已到。
     pub fn is_due_at(&self, now: DateTime<Local>) -> bool {
         if !self.enabled {
@@ -155,12 +200,7 @@ impl SipPlan {
         if now.hour() * 60 + now.minute() < hour * 60 + minute {
             return false;
         }
-        match self.frequency {
-            SipFrequency::Weekly => now.weekday().num_days_from_monday() + 1 == self.day as u32,
-            SipFrequency::Monthly => {
-                now.day() == self.day.min(last_day_of_month(now.year(), now.month())) as u32
-            }
-        }
+        self.is_sip_day(now)
     }
 
     /// 下一次定投时间；用于界面展示。
@@ -235,6 +275,90 @@ fn default_sip_time() -> String {
     "09:30".to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TradeSide {
+    Buy,
+    Sell,
+}
+
+impl TradeSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TradeSide::Buy => "buy",
+            TradeSide::Sell => "sell",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TradeSide::Buy => "买入",
+            TradeSide::Sell => "卖出",
+        }
+    }
+}
+
+/// 一笔成交。卖出时按「成交金额 - 手续费」冲减剩余本金（摊薄成本）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Trade {
+    /// 成交编号；交割单导入时用于去重
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub side: TradeSide,
+    /// 成交数量：股票为股数，基金为份额，黄金为克数
+    pub quantity: f64,
+    /// 成交价格 / 基金净值
+    pub price: f64,
+    /// 手续费、佣金、印花税等合计
+    #[serde(default)]
+    pub fee: f64,
+    /// 成交日期，格式 YYYY-MM-DD
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// 备注，例如交割单文件名
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl Trade {
+    /// 去重键：优先使用成交编号，缺失时按成交内容生成。
+    pub fn key(&self) -> String {
+        if let Some(id) = self
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return format!("{}:{id}", self.date.as_deref().unwrap_or("-"));
+        }
+        format!(
+            "{}:{}:{:.6}:{:.6}:{:.6}",
+            self.date.as_deref().unwrap_or("-"),
+            self.side.as_str(),
+            self.quantity,
+            self.price,
+            self.fee
+        )
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.quantity.is_finite() || self.quantity <= 0.0 {
+            bail!("成交数量必须大于 0");
+        }
+        if !self.price.is_finite() || self.price <= 0.0 {
+            bail!("成交价格必须大于 0");
+        }
+        if !self.fee.is_finite() || self.fee < 0.0 {
+            bail!("手续费不能为负数");
+        }
+        if let Some(date) = self.date.as_deref() {
+            NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
+                .with_context(|| format!("成交日期格式应为 YYYY-MM-DD：{date}"))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Asset {
     pub kind: AssetKind,
@@ -259,6 +383,13 @@ pub struct Asset {
     /// 本金；与 quantity 一起配置时可自动计算成本价
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<f64>,
+    /// 期初持仓日期（YYYY-MM-DD）。配置的 cost / principal / quantity
+    /// 视为这一天的持仓，成交流水只应用该日期之后的记录，避免重复计算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    /// 成交流水（手动记录或从交割单导入），按日期顺序计算摊薄成本
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trades: Vec<Trade>,
     /// 该资产单独的回本阈值（%），覆盖全局配置
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold_percent: Option<f64>,
@@ -289,22 +420,50 @@ impl Asset {
         self.name.clone().unwrap_or_else(|| self.id())
     }
 
-    /// 成本价：优先 cost，其次 principal / quantity
+    /// 当前持仓（期初持仓 + 配置里的成交流水）。
+    pub fn position(&self) -> crate::position::Position {
+        self.position_with(&[])
+    }
+
+    /// 当前持仓（期初持仓 + 配置流水 + 外部导入流水）。
+    pub fn position_with(&self, extra: &[Trade]) -> crate::position::Position {
+        crate::position::Position::derive_lossy(self, extra)
+    }
+
+    /// 成本价：没有成交流水时沿用 cost / principal ÷ quantity；
+    /// 有成交流水时使用摊薄后的剩余本金 ÷ 剩余数量。
     pub fn cost_price(&self) -> Option<f64> {
-        if let Some(cost) = self.cost {
-            return Some(cost);
-        }
-        match (self.principal, self.quantity) {
-            (Some(principal), Some(quantity)) if quantity > 0.0 => Some(principal / quantity),
-            _ => None,
+        self.cost_price_with(&[])
+    }
+
+    pub fn cost_price_with(&self, extra: &[Trade]) -> Option<f64> {
+        if self.trades.is_empty() && extra.is_empty() {
+            if let Some(cost) = self.cost {
+                return Some(cost);
+            }
+            match (self.principal, self.quantity) {
+                (Some(principal), Some(quantity)) if quantity > 0.0 => Some(principal / quantity),
+                _ => None,
+            }
+        } else {
+            self.position_with(extra).cost
         }
     }
 
     pub fn target_price(&self, global_threshold: f64) -> Option<f64> {
+        self.target_price_with(global_threshold, &[])
+    }
+
+    pub fn target_price_with(&self, global_threshold: f64, extra: &[Trade]) -> Option<f64> {
         if let Some(target) = self.target_price {
             return Some(target);
         }
-        let cost = self.cost_price()?;
+        // 本金已收回或已清仓时不再做回本提醒。
+        let position = self.position_with(extra);
+        if position.recovered || position.closed {
+            return None;
+        }
+        let cost = self.cost_price_with(extra)?;
         let threshold = self.threshold_percent.unwrap_or(global_threshold);
         Some(cost * (1.0 + threshold / 100.0))
     }
@@ -333,13 +492,30 @@ impl Asset {
         if self.cost.is_none()
             && self.target_price.is_none()
             && (self.principal.is_none() || self.quantity.is_none())
+            && self.trades.is_empty()
         {
-            bail!("资产「{label}」需要配置 cost，或者同时配置 principal 与 quantity");
+            bail!(
+                "资产「{label}」需要配置 cost、或者同时配置 principal 与 quantity、或者提供 trades 成交流水"
+            );
         }
 
         if self.principal.is_some() && self.quantity.is_none() && self.cost.is_none() {
             bail!("资产「{label}」配置了 principal，但缺少 quantity，无法计算成本价");
         }
+
+        if let Some(as_of) = self.as_of.as_deref() {
+            NaiveDate::parse_from_str(as_of.trim(), "%Y-%m-%d")
+                .with_context(|| format!("资产「{label}」的 as_of 格式应为 YYYY-MM-DD：{as_of}"))?;
+        }
+
+        for (index, trade) in self.trades.iter().enumerate() {
+            trade
+                .validate()
+                .with_context(|| format!("资产「{label}」第 {} 笔成交无效", index + 1))?;
+        }
+
+        crate::position::Position::derive(self, &[])
+            .with_context(|| format!("资产「{label}」的成交流水无法计算持仓"))?;
 
         for (field, value) in [
             ("cost", self.cost),
@@ -563,6 +739,12 @@ pub const SAMPLE_CONFIG: &str = r#"# ===========================================
 interval_secs = 60       # 轮询间隔，建议 >= 30 秒
 timeout_secs = 10
 threshold_percent = 0.0  # 0 表示价格超过成本价即提醒；2.0 表示盈利 2% 才提醒
+realtime = false         # 面板「实时价格」开关，开启后每 10 秒单独刷新行情
+
+# 交割单自动导入：把券商导出的 CSV / TXT 交割单放进这个目录，
+# 每次盯盘前自动读取新成交，卖出净额按摊薄成本扣减本金。
+# [import]
+# dir = "~/Documents/交割单"
 
 [notify]
 cooldown_secs = 1800       # 两次提醒的最小间隔（秒）
@@ -686,6 +868,27 @@ quantity = 100           # 克数
 # quantity = 1000         # 股数
 # # 成本价 = 10000 / 1000 = 10.00
 
+# 成交流水：在期初持仓上叠加买卖记录。
+# 卖出时按「成交数量 × 价格 - 手续费」冲减本金（摊薄成本）：
+#   剩余本金 = 期初本金 - 卖出净额，成本价 = 剩余本金 / 剩余数量。
+# as_of 表示 cost / principal / quantity 是这一天的持仓，
+# 只有该日期之后的成交才会被应用，避免与期初持仓重复计算。
+# [[assets]]
+# kind = "stock"
+# name = "浦发银行"
+# symbol = "sh600000"
+# as_of = "2026-11-04"
+# principal = 10000
+# quantity = 1000
+#
+# [[assets.trades]]
+# side = "sell"           # buy / sell
+# quantity = 500
+# price = 12.0
+# fee = 3.0
+# date = "2026-11-05"     # 交割单导入时自动填写
+# id = "20261105001"      # 成交编号，用于去重
+
 # 其他市场示例：
 # 港股：symbol = "00700.HK" 或 secid = "116.00700"
 # 美股：symbol = "AAPL"      或 secid = "105.AAPL"
@@ -706,6 +909,14 @@ mod tests {
         assert_eq!(config.assets[0].cost_price(), Some(10.0));
         assert!(config.assets[1].sip.is_some());
         assert!(config.assets[2].sip.is_none());
+        assert!(!config.realtime);
+    }
+
+    #[test]
+    fn realtime_defaults_off_but_parses() {
+        let config: Config = toml::from_str("realtime = true").expect("config should parse");
+        assert!(config.realtime);
+        assert!(!Config::default().realtime);
     }
 
     #[test]
@@ -730,6 +941,8 @@ mod tests {
             cost: None,
             quantity: Some(1000.0),
             principal: Some(12000.0),
+            as_of: None,
+            trades: Vec::new(),
             threshold_percent: None,
             target_price: None,
             sip: None,
@@ -817,6 +1030,8 @@ cost = 800.0
             cost: Some(800.0),
             quantity: None,
             principal: None,
+            as_of: None,
+            trades: Vec::new(),
             threshold_percent: None,
             target_price: Some(900.0),
             sip: None,

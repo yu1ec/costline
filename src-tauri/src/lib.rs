@@ -80,6 +80,10 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // 必须赶在后台盯盘发出第一条通知之前锁定通知身份。
+            #[cfg(target_os = "macos")]
+            desktop::pin_identity(app);
+
             let (config_path, state_path) = resolve_paths(app);
             migrate_legacy(&config_path, &state_path);
             let (config, load_error) = load_or_init_config(&config_path);
@@ -105,6 +109,7 @@ pub fn run() {
             commands::save_config,
             commands::check_now,
             commands::set_watching,
+            commands::set_realtime,
             commands::search_assets,
             commands::test_notify,
             commands::reset_state,
