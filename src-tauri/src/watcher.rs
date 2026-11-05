@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use costline_core::monitor::{self, Row};
-use costline_core::{delivery, Channel, State};
+use costline_core::{delivery, Channel, NoticeChannel, NoticeKind, NoticeRecord, State};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -23,6 +23,8 @@ pub struct SipPayload {
     pub title: String,
     pub body: String,
     pub reminders: Vec<monitor::SipReminder>,
+    /// 对应消息历史记录的 ID，便于前端「查看」时定位。
+    pub notice_id: Option<String>,
 }
 
 /// 实时价格刷新间隔（秒）。
@@ -182,15 +184,21 @@ pub async fn run_check(app: &AppHandle, notify_enabled: bool, force_notify: bool
 
             if notify_enabled && !report.triggered.is_empty() {
                 let notice = monitor::build_notice(&report.triggered);
+                let mut channels = notice_channels(&report.notify_results);
                 match desktop::send(app, &notice, desktop_sound.as_deref()) {
                     Ok(()) => {
+                        channels.push(notice_channel("系统通知", Ok(())));
                         // 没有其他渠道成功时，由系统通知来更新去重状态，避免反复触发。
                         if report.notify_success_count() == 0 {
                             mark_notified(&state_path, &report.triggered);
                         }
                     }
-                    Err(error) => eprintln!("[costline] 系统通知发送失败：{error}"),
+                    Err(error) => {
+                        eprintln!("[costline] 系统通知发送失败：{error}");
+                        channels.push(notice_channel("系统通知", Err(error)));
+                    }
                 }
+                let _ = record_notice(app, NoticeKind::Price, &notice, channels);
                 alert = Some(AlertPayload {
                     title: notice.title,
                     body: notice.body,
@@ -200,19 +208,26 @@ pub async fn run_check(app: &AppHandle, notify_enabled: bool, force_notify: bool
 
             if notify_enabled && !report.sip_due.is_empty() {
                 let notice = monitor::build_sip_notice(&report.sip_due);
+                let mut channels = notice_channels(&report.sip_notify_results);
                 match desktop::send(app, &notice, desktop_sound.as_deref()) {
                     Ok(()) => {
+                        channels.push(notice_channel("系统通知", Ok(())));
                         // 远程渠道都没有成功时，由系统通知来记录今天的定投提醒状态。
                         if report.sip_notify_success_count() == 0 {
                             mark_sip_notified(&state_path, &report.sip_due);
                         }
                     }
-                    Err(error) => eprintln!("[costline] 定投系统通知发送失败：{error}"),
+                    Err(error) => {
+                        eprintln!("[costline] 定投系统通知发送失败：{error}");
+                        channels.push(notice_channel("系统通知", Err(error)));
+                    }
                 }
+                let notice_id = record_notice(app, NoticeKind::Sip, &notice, channels);
                 sip_alert = Some(SipPayload {
                     title: notice.title,
                     body: notice.body,
                     reminders: report.sip_due.clone(),
+                    notice_id,
                 });
             }
 
@@ -257,6 +272,54 @@ pub async fn run_check(app: &AppHandle, notify_enabled: bool, force_notify: bool
         let _ = app.emit("sip", sip);
     }
     snapshot
+}
+
+fn notice_channel(label: &str, result: Result<(), String>) -> NoticeChannel {
+    NoticeChannel {
+        label: label.to_string(),
+        ok: result.is_ok(),
+        error: result.err(),
+    }
+}
+
+fn notice_channels(results: &[monitor::ChannelResult]) -> Vec<NoticeChannel> {
+    results
+        .iter()
+        .map(|result| NoticeChannel {
+            label: result.label.clone(),
+            ok: result.ok,
+            error: result.error.clone(),
+        })
+        .collect()
+}
+
+/// 把一条成功推送的消息写入历史，并通知前端刷新。
+///
+/// 所有渠道都失败时不会记录：下一轮还会重试，不算真正“推送过”。
+pub(crate) fn record_notice(
+    app: &AppHandle,
+    kind: NoticeKind,
+    notice: &costline_core::notify::Notice,
+    channels: Vec<NoticeChannel>,
+) -> Option<String> {
+    if !channels.iter().any(|channel| channel.ok) {
+        return None;
+    }
+
+    let record = NoticeRecord::new(kind, notice.title.clone(), notice.body.clone(), channels);
+    let state_path = {
+        let state = app.state::<AppState>();
+        state.state_path.clone()
+    };
+    let mut saved = State::load(&state_path);
+    saved.record_notice(record.clone());
+    if let Err(error) = saved.save(&state_path) {
+        eprintln!("[costline] 保存消息历史失败：{error:#}");
+        return None;
+    }
+
+    let _ = app.emit("notice", &record);
+    Some(record.id)
 }
 
 fn mark_sip_notified(state_path: &Path, reminders: &[monitor::SipReminder]) {

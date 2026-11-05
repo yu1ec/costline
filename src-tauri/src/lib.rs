@@ -112,6 +112,8 @@ pub fn run() {
             commands::set_realtime,
             commands::search_assets,
             commands::test_notify,
+            commands::get_notice_history,
+            commands::clear_notice_history,
             commands::reset_state,
             commands::open_config_dir,
             commands::quit_app,

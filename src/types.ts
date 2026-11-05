@@ -158,6 +158,7 @@ export interface SipPayload {
   title: string;
   body: string;
   reminders: SipReminder[];
+  notice_id?: string | null;
 }
 
 export interface Snapshot {
@@ -184,6 +185,23 @@ export interface AlertPayload {
   title: string;
   body: string;
   rows: Row[];
+}
+
+export type NoticeKind = "price" | "sip" | "test";
+
+export interface NoticeChannel {
+  label: string;
+  ok: boolean;
+  error?: string | null;
+}
+
+export interface NoticeRecord {
+  id: string;
+  at: number;
+  kind: NoticeKind;
+  title: string;
+  body: string;
+  channels: NoticeChannel[];
 }
 
 export interface ChannelResult {

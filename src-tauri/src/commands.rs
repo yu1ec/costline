@@ -1,4 +1,7 @@
-use costline_core::{config, market, monitor, notify, Channel, ChannelResult, Config, SearchItem};
+use costline_core::{
+    config, market, monitor, notify, Channel, ChannelResult, Config, NoticeKind, NoticeRecord,
+    SearchItem,
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::desktop;
@@ -147,7 +150,46 @@ pub async fn test_notify(app: AppHandle, config: Config) -> Result<Vec<ChannelRe
         error: result.result.err().map(|error| format!("{error:#}")),
     }));
 
+    // 测试消息也进入历史，方便确认哪个渠道真正收到过推送。
+    let channels = results
+        .iter()
+        .map(|result| costline_core::NoticeChannel {
+            label: result.label.clone(),
+            ok: result.ok,
+            error: result.error.clone(),
+        })
+        .collect::<Vec<_>>();
+    if channels.iter().any(|channel| channel.ok) {
+        let lock = {
+            let state = app.state::<AppState>();
+            state.check_lock.clone()
+        };
+        let _guard = lock.lock().await;
+        watcher::record_notice(&app, NoticeKind::Test, &notice, channels);
+    }
+
     Ok(results)
+}
+
+#[tauri::command]
+pub fn get_notice_history(state: State<'_, AppState>) -> Vec<NoticeRecord> {
+    costline_core::State::load(&state.state_path).notices_desc()
+}
+
+#[tauri::command]
+pub async fn clear_notice_history(app: AppHandle) -> Result<(), String> {
+    let (state_path, lock) = {
+        let state = app.state::<AppState>();
+        (state.state_path.clone(), state.check_lock.clone())
+    };
+    let _guard = lock.lock().await;
+    let mut saved = costline_core::State::load(&state_path);
+    saved.clear_notices();
+    saved
+        .save(&state_path)
+        .map_err(|error| format!("清空消息历史失败：{error:#}"))?;
+    let _ = app.emit("notice-cleared", ());
+    Ok(())
 }
 
 #[tauri::command]

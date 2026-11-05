@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -18,7 +18,13 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api";
-import type { AlertPayload, Config, SipPayload, Snapshot } from "./types";
+import type {
+  AlertPayload,
+  Config,
+  NoticeRecord,
+  SipPayload,
+  Snapshot,
+} from "./types";
 import { draftToAsset, type AssetDraft } from "./drafts";
 import {
   DISGUISE_PERSONAS,
@@ -28,13 +34,16 @@ import {
   type DisguisePersonaId,
 } from "./disguise";
 import { Dashboard } from "./pages/Dashboard";
+import { History } from "./pages/History";
 import { Settings } from "./pages/Settings";
 import { DisguiseScreen, MaskedBoard } from "./components/Disguise";
 import { formatAmount, formatPrice, formatTime } from "./format";
 import { useUpdateController } from "./updater";
 
-type Tab = "dashboard" | "settings";
+type Tab = "dashboard" | "history" | "settings";
 type Theme = "dark" | "light";
+
+const NOTICE_SEEN_KEY = "costline-notice-seen-at";
 type ToastState = { id: number; text: string; tone: "ok" | "error" };
 type DisguiseState = {
   persona: DisguisePersonaId;
@@ -52,6 +61,12 @@ export default function App() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const [alert, setAlert] = useState<AlertPayload | null>(null);
   const [sipAlert, setSipAlert] = useState<SipPayload | null>(null);
+  const [noticeFocus, setNoticeFocus] = useState<{
+    id: string | null;
+    nonce: number;
+  }>({ id: null, nonce: 0 });
+  const [unread, setUnread] = useState(0);
+  const tabRef = useRef(tab);
   const [theme, setTheme] = useState<Theme>(() =>
     document.documentElement.dataset.theme === "light" ? "light" : "dark",
   );
@@ -139,6 +154,64 @@ export default function App() {
     },
     [],
   );
+
+  useEffect(() => {
+    tabRef.current = tab;
+  }, [tab]);
+
+  // 新推送到达时累加未读；已经在消息页时直接看到了，不计数。
+  useEffect(() => {
+    let disposed = false;
+    const stops: (() => void)[] = [];
+    listen<NoticeRecord>("notice", () => {
+      if (tabRef.current === "history") {
+        // 正在消息页时直接看到了，同步已读时间，避免下次启动重复计数。
+        localStorage.setItem(
+          NOTICE_SEEN_KEY,
+          String(Math.floor(Date.now() / 1000)),
+        );
+      } else {
+        setUnread((current) => current + 1);
+      }
+    }).then((stop) => {
+      if (disposed) stop();
+      else stops.push(stop);
+    });
+    listen("notice-cleared", () => setUnread(0)).then((stop) => {
+      if (disposed) stop();
+      else stops.push(stop);
+    });
+    return () => {
+      disposed = true;
+      stops.forEach((stop) => stop());
+    };
+  }, []);
+
+  // 首次启动时以当前时间为已读基线，之后启动则统计离线期间的新消息。
+  useEffect(() => {
+    const now = Math.floor(Date.now() / 1000);
+    const seenAt = Number(localStorage.getItem(NOTICE_SEEN_KEY) ?? 0);
+    if (!seenAt) {
+      localStorage.setItem(NOTICE_SEEN_KEY, String(now));
+      return;
+    }
+    void api
+      .getNoticeHistory()
+      .then((items) => {
+        setUnread(items.filter((item) => item.at > seenAt).length);
+      })
+      .catch(() => {});
+  }, []);
+
+  const openHistory = useCallback((id: string | null = null) => {
+    setTab("history");
+    setNoticeFocus({ id, nonce: Date.now() });
+    setUnread(0);
+    localStorage.setItem(
+      NOTICE_SEEN_KEY,
+      String(Math.floor(Date.now() / 1000)),
+    );
+  }, []);
 
   useEffect(() => {
     if (!toast) return;
@@ -356,6 +429,22 @@ export default function App() {
             <EyeOff size={15} />
             伪装
           </button>
+          <button
+            type="button"
+            className={
+              tab === "history"
+                ? "btn ghost notice-entry active"
+                : "btn ghost notice-entry"
+            }
+            onClick={() => openHistory()}
+            title="查看已推送的消息历史"
+          >
+            <Bell size={15} />
+            消息
+            {unread > 0 ? (
+              <span className="notice-badge">{unread > 99 ? "99+" : unread}</span>
+            ) : null}
+          </button>
           {tab === "dashboard" ? (
             <>
               <button
@@ -472,7 +561,7 @@ export default function App() {
             type="button"
             className="btn ghost"
             onClick={() => {
-              setTab("dashboard");
+              openHistory(sipAlert.notice_id ?? null);
               setSipAlert(null);
             }}
           >
@@ -514,6 +603,12 @@ export default function App() {
             onToggleRealtime={toggleRealtime}
             onAddAsset={addAsset}
             onOpenSettings={() => setTab("settings")}
+          />
+        ) : tab === "history" ? (
+          <History
+            focusId={noticeFocus.id}
+            focusNonce={noticeFocus.nonce}
+            onToast={showToast}
           />
         ) : (
           <Settings

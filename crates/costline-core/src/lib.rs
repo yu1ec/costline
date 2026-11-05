@@ -17,4 +17,4 @@ pub use monitor::{
     SipPeriodStatus, SipReminder, SipTradeInfo,
 };
 pub use position::Position;
-pub use state::State;
+pub use state::{NoticeChannel, NoticeKind, NoticeRecord, State};

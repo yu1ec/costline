@@ -3,6 +3,7 @@ import type {
   AssetSearchItem,
   ChannelResult,
   Config,
+  NoticeRecord,
   Snapshot,
 } from "./types";
 
@@ -17,6 +18,8 @@ export const api = {
   searchAssets: (keyword: string) =>
     invoke<AssetSearchItem[]>("search_assets", { keyword }),
   testNotify: (config: Config) => invoke<ChannelResult[]>("test_notify", { config }),
+  getNoticeHistory: () => invoke<NoticeRecord[]>("get_notice_history"),
+  clearNoticeHistory: () => invoke<void>("clear_notice_history"),
   resetState: () => invoke<Snapshot>("reset_state"),
   openConfigDir: () => invoke<void>("open_config_dir"),
   quit: () => invoke<void>("quit_app"),
