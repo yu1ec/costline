@@ -214,6 +214,12 @@ pub struct Quote {
 }
 
 impl Quote {
+    pub fn change_amount(&self) -> Option<f64> {
+        self.prev_close
+            .filter(|prev| *prev > 0.0)
+            .map(|prev| self.price - prev)
+    }
+
     pub fn change_percent(&self) -> Option<f64> {
         self.prev_close
             .filter(|prev| *prev > 0.0)
@@ -459,41 +465,45 @@ async fn fetch_danjuan(client: &Client, code: &str) -> Result<Quote> {
         .filter(|name| !name.is_empty())
         .map(str::to_string);
 
-    if let Some(derived) = data.get("fund_derived") {
-        if let Some(nav) = json_number(derived.get("unit_nav")).filter(|nav| *nav > 0.0) {
-            let end_date = derived
-                .get("end_date")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let note = if end_date.is_empty() {
-                "蛋卷最新净值".to_string()
-            } else {
-                format!("最新净值 {end_date}")
-            };
-            return Ok(Quote {
-                price: nav,
-                prev_close: None,
-                name,
-                note,
-                currency: "CNY",
-                source: "danjuan",
-            });
+    // 净值历史一次取两条，用前一条净值计算日涨跌，避免面板上的日涨跌缺失。
+    match fetch_danjuan_history(client, code).await {
+        Ok((nav, prev_close, date)) => Ok(Quote {
+            price: nav,
+            prev_close,
+            name,
+            note: format!("最新净值 {date}"),
+            currency: "CNY",
+            source: "danjuan",
+        }),
+        Err(history_error) => {
+            if let Some(derived) = data.get("fund_derived") {
+                if let Some(nav) = json_number(derived.get("unit_nav")).filter(|nav| *nav > 0.0) {
+                    let end_date = derived
+                        .get("end_date")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let note = if end_date.is_empty() {
+                        "蛋卷最新净值".to_string()
+                    } else {
+                        format!("最新净值 {end_date}")
+                    };
+                    return Ok(Quote {
+                        price: nav,
+                        prev_close: None,
+                        name,
+                        note,
+                        currency: "CNY",
+                        source: "danjuan",
+                    });
+                }
+            }
+            Err(history_error)
         }
     }
-
-    let (nav, date) = fetch_danjuan_history(client, code).await?;
-    Ok(Quote {
-        price: nav,
-        prev_close: None,
-        name,
-        note: format!("最新净值 {date}"),
-        currency: "CNY",
-        source: "danjuan",
-    })
 }
 
-async fn fetch_danjuan_history(client: &Client, code: &str) -> Result<(f64, String)> {
-    let url = format!("https://danjuanfunds.com/djapi/fund/nav/history/{code}?page=1&size=1");
+async fn fetch_danjuan_history(client: &Client, code: &str) -> Result<(f64, Option<f64>, String)> {
+    let url = format!("https://danjuanfunds.com/djapi/fund/nav/history/{code}?page=1&size=2");
     let response = client
         .get(&url)
         .header("Referer", "https://danjuanfunds.com/")
@@ -509,20 +519,26 @@ async fn fetch_danjuan_history(client: &Client, code: &str) -> Result<(f64, Stri
     if value.get("result_code").and_then(Value::as_i64) != Some(0) {
         bail!("蛋卷基金净值接口返回错误：{}", truncate(&body, 200));
     }
-    let item = value
+    let items = value
         .get("data")
         .and_then(|data| data.get("items"))
-        .and_then(|items| items.get(0))
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
         .ok_or_else(|| anyhow!("蛋卷基金没有净值数据"))?;
+    let item = &items[0];
     let nav = json_number(item.get("nav"))
         .filter(|nav| *nav > 0.0)
         .ok_or_else(|| anyhow!("蛋卷基金净值格式异常"))?;
+    let prev_close = items
+        .get(1)
+        .and_then(|item| json_number(item.get("nav")))
+        .filter(|nav| *nav > 0.0);
     let date = item
         .get("date")
         .and_then(Value::as_str)
         .unwrap_or("未知日期")
         .to_string();
-    Ok((nav, date))
+    Ok((nav, prev_close, date))
 }
 
 /// 场外基金申购状态（天天基金基础信息接口）。

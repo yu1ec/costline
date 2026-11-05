@@ -16,6 +16,7 @@ import {
   formatMoney,
   formatPercent,
   formatPrice,
+  formatSignedPrice,
   formatSipDate,
   formatTime,
 } from "../format";
@@ -259,6 +260,19 @@ export function Dashboard({
                 <div className="cell">
                   <strong className="mono price">{formatPrice(row.price)}</strong>
                   <span className="cell-sub">{row.currency}</span>
+                  {snapshot?.realtime && row.change_percent != null ? (
+                    <span
+                      className={
+                        row.change_percent >= 0
+                          ? "cell-sub live up"
+                          : "cell-sub live down"
+                      }
+                      title="实时涨跌（相对昨收），随实时价格一起刷新"
+                    >
+                      实时 {formatSignedPrice(row.change_amount)} (
+                      {formatPercent(row.change_percent)})
+                    </span>
+                  ) : null}
                 </div>
                 <div className="cell">
                   <span className="mono">

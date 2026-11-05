@@ -61,6 +61,8 @@ pub struct Row {
     pub cost: Option<f64>,
     /// 触发价；本金已收回或已清仓时为 None
     pub target: Option<f64>,
+    /// 相对昨收的涨跌额
+    pub change_amount: Option<f64>,
     pub change_percent: Option<f64>,
     pub pnl: Option<f64>,
     /// 摊薄后的剩余本金；未配置持仓数量时为 None
@@ -262,6 +264,7 @@ pub async fn check(
                     price: quote.price,
                     cost,
                     target,
+                    change_amount: quote.change_amount(),
                     change_percent: quote.change_percent(),
                     pnl: position.market_pnl(quote.price),
                     principal: position.has_position.then_some(position.principal),
@@ -798,6 +801,7 @@ mod tests {
             price: 10.5,
             cost: Some(10.0),
             target: Some(10.0),
+            change_amount: Some(0.12),
             change_percent: Some(1.2),
             pnl: Some(500.0),
             principal: Some(10000.0),

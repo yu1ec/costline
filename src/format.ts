@@ -5,6 +5,14 @@ export function formatPrice(value: number | null | undefined): string {
   return value.toFixed(decimals);
 }
 
+/** 带正负号的涨跌额，例如 +0.12 / -1.05 */
+export function formatSignedPrice(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "-";
+  const abs = Math.abs(value);
+  const decimals = abs < 1 ? 4 : abs < 10 ? 3 : 2;
+  return `${value >= 0 ? "+" : ""}${value.toFixed(decimals)}`;
+}
+
 export function formatPercent(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "-";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;

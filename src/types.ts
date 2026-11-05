@@ -123,6 +123,7 @@ export interface Row {
   price: number;
   cost: number | null;
   target: number | null;
+  change_amount: number | null;
   change_percent: number | null;
   pnl: number | null;
   principal: number | null;

@@ -693,6 +693,14 @@ button {
   white-space: nowrap;
 }
 
+.cell-sub.up {
+  color: var(--up);
+}
+
+.cell-sub.down {
+  color: var(--down);
+}
+
 .cell .price {
   font-size: 15px;
   font-weight: 600;
@@ -1633,12 +1641,10 @@ button {
 @media (max-width: 820px) {
   .table-head,
   .table-row {
-    grid-template-columns: minmax(170px, 1.7fr) repeat(2, minmax(80px, 0.8fr)) minmax(90px, 1fr) 80px;
-  }
-
-  .table-head span:nth-child(4),
-  .table-row .cell:nth-child(4) {
-    display: none;
+    grid-template-columns:
+      minmax(150px, 1.5fr) minmax(70px, 0.7fr) minmax(92px, 0.9fr)
+      minmax(66px, 0.6fr) minmax(100px, 0.9fr) 72px;
+    gap: 8px;
   }
 
   .channel-grid {
