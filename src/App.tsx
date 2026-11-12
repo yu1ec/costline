@@ -213,6 +213,29 @@ export default function App() {
     );
   }, []);
 
+  // 托盘下拉面板里点「消息 / 设置」时，主面板切到对应页。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<string>("open-tab", (event) => {
+      const target = event.payload;
+      if (target === "history") {
+        openHistory();
+      } else if (target === "settings") {
+        setTab("settings");
+      } else {
+        setTab("dashboard");
+      }
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [openHistory]);
+
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(null), 4200);

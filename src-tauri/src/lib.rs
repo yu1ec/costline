@@ -98,6 +98,13 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == tray::PANEL_LABEL {
+                // 下拉面板是临时浮层：失焦即收起（点桌面、切换应用都会触发）。
+                if let tauri::WindowEvent::Focused(false) = event {
+                    tray::hide_panel(window.app_handle());
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
@@ -117,6 +124,9 @@ pub fn run() {
             commands::reset_state,
             commands::open_config_dir,
             commands::quit_app,
+            commands::open_dashboard,
+            commands::hide_tray_panel,
+            commands::resize_tray_panel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Costline");

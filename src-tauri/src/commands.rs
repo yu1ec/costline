@@ -6,6 +6,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::desktop;
 use crate::state::{AppState, Snapshot};
+use crate::tray;
 use crate::watcher;
 
 #[tauri::command]
@@ -224,4 +225,29 @@ pub fn open_config_dir(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
     app.exit(0);
+}
+
+/// 下拉面板里的「打开完整面板」，可指定要切换到的 tab。
+#[tauri::command]
+pub fn open_dashboard(app: AppHandle, tab: Option<String>) {
+    if let Some(tab) = tab {
+        let _ = app.emit("open-tab", tab);
+    }
+    tray::show_dashboard(&app);
+}
+
+/// 下拉面板失焦或按 Esc 时收起。
+#[tauri::command]
+pub fn hide_tray_panel(app: AppHandle) {
+    tray::hide_panel(&app);
+}
+
+/// 下拉面板内容高度变化后，让窗口贴合内容（逻辑像素）。
+#[tauri::command]
+pub fn resize_tray_panel(app: AppHandle, height: f64) {
+    let Some(window) = app.get_webview_window(tray::PANEL_LABEL) else {
+        return;
+    };
+    let height = height.clamp(180.0, 680.0);
+    let _ = window.set_size(tauri::LogicalSize::new(380.0, height));
 }

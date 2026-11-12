@@ -259,17 +259,29 @@ fn mentions_gold(text: &str) -> bool {
 
 /// 获取国内金价（上海金 Au99.99，元/克）。
 pub async fn fetch_domestic_gold(client: &Client) -> Result<GoldReference> {
-    let quote = fetch_eastmoney(client, DOMESTIC_GOLD_SECID).await?;
-    Ok(GoldReference {
+    let mut errors = Vec::new();
+    match fetch_eastmoney(client, DOMESTIC_GOLD_SECID).await {
+        Ok(quote) => return Ok(domestic_gold_reference(&quote)),
+        Err(error) => errors.push(format!("{error:#}")),
+    }
+    match fetch_sina(client, "gds_AU9999").await {
+        Ok(quote) => return Ok(domestic_gold_reference(&quote)),
+        Err(error) => errors.push(format!("{error:#}")),
+    }
+    Err(anyhow!("{}", errors.join("；")))
+}
+
+fn domestic_gold_reference(quote: &Quote) -> GoldReference {
+    GoldReference {
         price: quote.price,
         change_percent: quote.change_percent(),
         note: "上海金 Au99.99（元/克）".to_string(),
-    })
+    }
 }
 
 pub async fn fetch_quote(client: &Client, asset: &Asset) -> Result<Quote> {
     if let Some(secid) = &asset.secid {
-        return fetch_eastmoney_candidates(client, std::slice::from_ref(secid)).await;
+        return fetch_quote_by_secids(client, std::slice::from_ref(secid)).await;
     }
 
     match asset.kind {
@@ -279,7 +291,7 @@ pub async fn fetch_quote(client: &Client, asset: &Asset) -> Result<Quote> {
                 .as_deref()
                 .ok_or_else(|| anyhow!("股票缺少 symbol"))?;
             let secids = stock_secids(raw)?;
-            fetch_eastmoney_candidates(client, &secids).await
+            fetch_quote_by_secids(client, &secids).await
         }
         AssetKind::Fund => fetch_fund(client, asset).await,
         AssetKind::Gold => fetch_gold(client, asset).await,
@@ -295,18 +307,29 @@ async fn fetch_fund(client: &Client, asset: &Asset) -> Result<Quote> {
 
     if is_exchange_fund(raw) {
         let market = if raw.starts_with("15") { "0" } else { "1" };
-        return fetch_eastmoney_candidates(client, &[format!("{market}.{raw}")]).await;
+        return fetch_quote_by_secids(client, &[format!("{market}.{raw}")]).await;
     }
 
+    // 场外基金：估值 -> 蛋卷 -> 新浪 -> 天天基金净值历史，逐个回退。
+    let mut errors = Vec::new();
     match fetch_fundgz(client, raw).await {
-        Ok(quote) => Ok(quote),
-        Err(primary_error) => match fetch_danjuan(client, raw).await {
-            Ok(quote) => Ok(quote),
-            Err(fallback_error) => bail!(
-                "基金 {raw} 获取失败。估值接口：{primary_error:#}；备用接口：{fallback_error:#}"
-            ),
-        },
+        Ok(quote) => return Ok(quote),
+        Err(error) => errors.push(format!("估值接口：{error:#}")),
     }
+    match fetch_danjuan(client, raw).await {
+        Ok(quote) => return Ok(quote),
+        Err(error) => errors.push(format!("蛋卷接口：{error:#}")),
+    }
+    match fetch_sina(client, &format!("f_{raw}")).await {
+        Ok(quote) => return Ok(quote),
+        Err(error) => errors.push(format!("新浪接口：{error:#}")),
+    }
+    match fetch_fund_lsjz(client, raw).await {
+        Ok(quote) => return Ok(quote),
+        Err(error) => errors.push(format!("净值历史接口：{error:#}")),
+    }
+
+    Err(anyhow!("基金 {raw} 获取失败。{}", errors.join("；")))
 }
 
 async fn fetch_gold(client: &Client, asset: &Asset) -> Result<Quote> {
@@ -318,23 +341,96 @@ async fn fetch_gold(client: &Client, asset: &Asset) -> Result<Quote> {
             } else {
                 symbol.to_string()
             };
-            return fetch_sina_gold(client, &sina_symbol).await;
+            return fetch_sina(client, &sina_symbol).await;
         }
     }
 
     let secids = gold_secids(asset.symbol.as_deref())?;
-    fetch_eastmoney_candidates(client, &secids).await
+    fetch_quote_by_secids(client, &secids).await
 }
 
-async fn fetch_eastmoney_candidates(client: &Client, secids: &[String]) -> Result<Quote> {
-    let mut last_error = None;
+/// 先按 secid 走东方财富，失败后按 secid 推导腾讯 / 新浪代码继续回退。
+async fn fetch_quote_by_secids(client: &Client, secids: &[String]) -> Result<Quote> {
+    let mut errors = Vec::new();
     for secid in secids {
         match fetch_eastmoney(client, secid).await {
             Ok(quote) => return Ok(quote),
-            Err(error) => last_error = Some(error),
+            Err(error) => errors.push(format!("{error:#}")),
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("没有可用的 secid")))
+
+    let mut tried: Vec<String> = Vec::new();
+    for secid in secids {
+        for (source, symbol) in fallback_symbols(secid) {
+            if tried.iter().any(|item| item == &symbol) {
+                continue;
+            }
+            tried.push(symbol.clone());
+            let result = match source {
+                FallbackSource::Tencent => fetch_tencent(client, &symbol).await,
+                FallbackSource::Sina => fetch_sina(client, &symbol).await,
+            };
+            match result {
+                Ok(quote) => return Ok(quote),
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+    }
+
+    Err(anyhow!("{}", errors.join("；")))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FallbackSource {
+    Tencent,
+    Sina,
+}
+
+/// 把东方财富 secid 映射成腾讯 / 新浪的行情代码。
+fn fallback_symbols(secid: &str) -> Vec<(FallbackSource, String)> {
+    let Some((market, code)) = secid.split_once('.') else {
+        return Vec::new();
+    };
+    let code = code.trim();
+    if code.is_empty() || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Vec::new();
+    }
+
+    match market {
+        "1" => vec![
+            (FallbackSource::Tencent, format!("sh{code}")),
+            (FallbackSource::Sina, format!("sh{code}")),
+        ],
+        "0" => {
+            // BJ exchange codes start with 4 / 8 / 92; everything else is SZ.
+            let prefix = if code.starts_with('4') || code.starts_with('8') || code.starts_with("92")
+            {
+                "bj"
+            } else {
+                "sz"
+            };
+            vec![
+                (FallbackSource::Tencent, format!("{prefix}{code}")),
+                (FallbackSource::Sina, format!("{prefix}{code}")),
+            ]
+        }
+        "116" => vec![(FallbackSource::Tencent, format!("hk{}", pad_left(code, 5)))],
+        "105" | "106" | "107" => {
+            let upper = code.to_uppercase();
+            vec![
+                (FallbackSource::Tencent, format!("us{upper}")),
+                (FallbackSource::Sina, format!("gb_{}", upper.to_lowercase())),
+            ]
+        }
+        "118" => vec![(FallbackSource::Sina, format!("gds_{}", code.to_uppercase()))],
+        // Eastmoney 113.aum = SHFE gold main contract, Sina calls it nf_AU0.
+        "113" => match code.to_lowercase().as_str() {
+            "aum" => vec![(FallbackSource::Sina, "nf_AU0".to_string())],
+            "agm" => vec![(FallbackSource::Sina, "nf_AG0".to_string())],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 async fn fetch_eastmoney(client: &Client, secid: &str) -> Result<Quote> {
@@ -721,63 +817,257 @@ fn parse_fund_trade_status(data: &Value, fallback_code: &str) -> FundTradeStatus
     }
 }
 
-async fn fetch_sina_gold(client: &Client, symbol: &str) -> Result<Quote> {
+/// 腾讯行情：`https://qt.gtimg.cn/q=sh601288`，覆盖 A 股 / 港股 / 美股 / 场内基金。
+async fn fetch_tencent(client: &Client, symbol: &str) -> Result<Quote> {
+    let url = format!("https://qt.gtimg.cn/q={symbol}");
+    let response = client
+        .get(&url)
+        .header("Referer", "https://gu.qq.com/")
+        .send()
+        .await
+        .with_context(|| format!("请求腾讯行情失败（{symbol}）"))?;
+    let status = response.status();
+    let body = read_gbk(response).await.context("读取腾讯行情响应失败")?;
+    if !status.is_success() {
+        bail!(
+            "腾讯行情返回 HTTP {status}（{symbol}）：{}",
+            truncate(&body, 200)
+        );
+    }
+    parse_tencent_quote(symbol, &body)
+}
+
+fn parse_tencent_quote(symbol: &str, body: &str) -> Result<Quote> {
+    let data = extract_quoted(body).ok_or_else(|| anyhow!("腾讯行情返回格式异常（{symbol}）"))?;
+    let fields: Vec<&str> = data.split('~').collect();
+    // 代码不存在时返回 v_pv_none_match="1"，字段数不足。
+    if fields.len() < 5 {
+        bail!("腾讯行情没有 {symbol} 的报价");
+    }
+
+    let price = fields[3]
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|price| *price > 0.0)
+        .ok_or_else(|| anyhow!("腾讯行情没有 {symbol} 的有效价格"))?;
+    let prev_close = fields[4]
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|price| *price > 0.0);
+    let name = fields[1].trim();
+
+    Ok(Quote {
+        price,
+        prev_close,
+        name: (!name.is_empty()).then(|| name.to_string()),
+        note: "腾讯行情".to_string(),
+        currency: currency_of_symbol(symbol),
+        source: "tencent",
+    })
+}
+
+/// 新浪行情：覆盖 A 股 / 北交所 / 美股（`gb_`）/ 上海金（`gds_`）/ 场外基金（`f_`）/ 国际金价（`hf_`）。
+async fn fetch_sina(client: &Client, symbol: &str) -> Result<Quote> {
     let url = format!("https://hq.sinajs.cn/list={symbol}");
     let response = client
         .get(&url)
         .header("Referer", "https://finance.sina.com.cn/")
         .send()
         .await
-        .context("请求新浪黄金行情失败")?;
+        .with_context(|| format!("请求新浪行情失败（{symbol}）"))?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = read_gbk(response).await.context("读取新浪行情响应失败")?;
     if !status.is_success() {
-        bail!("新浪返回 HTTP {status}");
+        bail!(
+            "新浪行情返回 HTTP {status}（{symbol}）：{}",
+            truncate(&body, 200)
+        );
     }
+    parse_sina_quote(symbol, &body)
+}
 
-    let start = body.find('"').ok_or_else(|| anyhow!("新浪返回格式异常"))?;
-    let end = body.rfind('"').ok_or_else(|| anyhow!("新浪返回格式异常"))?;
-    if end <= start {
-        bail!("新浪返回格式异常");
-    }
-    let data = &body[start + 1..end];
-    if data.trim().is_empty() {
-        bail!("新浪没有返回 {symbol} 的报价");
-    }
-
+fn parse_sina_quote(symbol: &str, body: &str) -> Result<Quote> {
+    let data = extract_quoted(body).ok_or_else(|| anyhow!("新浪行情返回格式异常（{symbol}）"))?;
     let fields: Vec<&str> = data.split(',').collect();
-    let (price_index, prev_index) = if symbol.starts_with("hf_") {
-        (0, 7)
-    } else {
-        (8, 5)
+    let number = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|value: &&str| value.trim().parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
     };
-    let price = fields
-        .get(price_index)
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|price| *price > 0.0)
-        .ok_or_else(|| anyhow!("无法解析新浪 {symbol} 的报价"))?;
-    let prev_close = fields
-        .get(prev_index)
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|price| *price > 0.0);
-    let currency = if symbol.starts_with("hf_") {
+    let text = |index: usize| {
+        fields
+            .get(index)
+            .map(|value: &&str| value.trim())
+            .filter(|value: &&str| !value.is_empty())
+            .map(str::to_string)
+    };
+
+    // 场外基金：名称, 单位净值, 累计净值, 前一日净值, 日期, 规模
+    if symbol.starts_with("f_") {
+        let price = number(1).ok_or_else(|| anyhow!("新浪没有 {symbol} 的有效净值"))?;
+        let date = text(4).unwrap_or_default();
+        let note = if date.is_empty() {
+            "新浪最新净值".to_string()
+        } else {
+            format!("最新净值 {date}")
+        };
+        return Ok(Quote {
+            price,
+            prev_close: number(3),
+            name: text(0),
+            note,
+            currency: "CNY",
+            source: "sina",
+        });
+    }
+
+    // 国内期货主连：名称, 时间, 开, 高, 低, 昨收, ... 最新价(8), 结算价(9), 昨结算(10)
+    if symbol.starts_with("nf_") {
+        let price = number(8).ok_or_else(|| anyhow!("新浪没有 {symbol} 的有效报价"))?;
+        return Ok(Quote {
+            price,
+            prev_close: number(10).or_else(|| number(5)),
+            name: text(0),
+            note: "新浪期货行情".to_string(),
+            currency: "CNY",
+            source: "sina",
+        });
+    }
+
+    // 上海金 / 国际金价：现价, ..., 昨收(7), ..., 名称(13)
+    if symbol.starts_with("gds_") || symbol.starts_with("hf_") {
+        let price = number(0).ok_or_else(|| anyhow!("新浪没有 {symbol} 的有效报价"))?;
+        let currency = if symbol.starts_with("hf_") {
+            "USD"
+        } else {
+            "CNY"
+        };
+        let note = if currency == "USD" {
+            "新浪国际金价（USD/盎司）".to_string()
+        } else {
+            "新浪黄金报价".to_string()
+        };
+        return Ok(Quote {
+            price,
+            prev_close: number(7),
+            name: text(13),
+            note,
+            currency,
+            source: "sina",
+        });
+    }
+
+    // 美股：名称, 现价, 涨跌幅%, 时间, 涨跌额, 今开, 最高, 最低 ...
+    if symbol.starts_with("gb_") {
+        let price = number(1).ok_or_else(|| anyhow!("新浪没有 {symbol} 的有效报价"))?;
+        let change = fields
+            .get(4)
+            .and_then(|value: &&str| value.trim().parse::<f64>().ok());
+        let prev_close = change
+            .map(|change| price - change)
+            .filter(|value| *value > 0.0);
+        return Ok(Quote {
+            price,
+            prev_close,
+            name: text(0),
+            note: "新浪美股行情".to_string(),
+            currency: "USD",
+            source: "sina",
+        });
+    }
+
+    // A 股 / 北交所：名称, 今开, 昨收, 现价, 最高, 最低 ...
+    let price = number(3).ok_or_else(|| anyhow!("新浪没有 {symbol} 的有效报价"))?;
+    Ok(Quote {
+        price,
+        prev_close: number(2),
+        name: text(0),
+        note: "新浪行情".to_string(),
+        currency: "CNY",
+        source: "sina",
+    })
+}
+
+fn currency_of_symbol(symbol: &str) -> &'static str {
+    if symbol.starts_with("hk") {
+        "HKD"
+    } else if symbol.starts_with("us") {
         "USD"
     } else {
         "CNY"
-    };
-    let note = if currency == "USD" {
-        "新浪国际金价（USD/盎司）".to_string()
-    } else {
-        "新浪黄金报价".to_string()
-    };
+    }
+}
 
+async fn read_gbk(response: reqwest::Response) -> Result<String> {
+    let bytes = response.bytes().await.context("读取响应内容失败")?;
+    let (text, _, _) = encoding_rs::GB18030.decode(&bytes);
+    Ok(text.into_owned())
+}
+
+/// 天天基金净值历史（`api.fund.eastmoney.com`，与 push2 不是同一套接口）。
+async fn fetch_fund_lsjz(client: &Client, code: &str) -> Result<Quote> {
+    let url = "https://api.fund.eastmoney.com/f10/lsjz";
+    let response = client
+        .get(url)
+        .query(&[("fundCode", code), ("pageIndex", "1"), ("pageSize", "2")])
+        .header(
+            "Referer",
+            format!("https://fundf10.eastmoney.com/jjjz_{code}.html"),
+        )
+        .send()
+        .await
+        .context("请求基金净值历史失败")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("基金净值历史返回 HTTP {status}：{}", truncate(&body, 200));
+    }
+
+    let value: Value = serde_json::from_str(&body).context("解析基金净值历史 JSON 失败")?;
+    if value
+        .get("ErrCode")
+        .is_some_and(|err| json_i64(Some(err)) != Some(0))
+    {
+        bail!("基金净值历史返回错误：{}", truncate(&body, 200));
+    }
+    let items = value
+        .pointer("/Data/LSJZList")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| anyhow!("基金净值历史没有数据"))?;
+
+    let nav = json_number(items[0].get("DWJZ"))
+        .filter(|nav| *nav > 0.0)
+        .ok_or_else(|| anyhow!("基金净值历史格式异常"))?;
+    let date = items[0]
+        .get("FSRQ")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let prev_close = items
+        .get(1)
+        .and_then(|item| json_number(item.get("DWJZ")))
+        .filter(|nav| *nav > 0.0)
+        .or_else(|| {
+            let percent = json_number(items[0].get("JZZZL"))?;
+            let prev = nav / (1.0 + percent / 100.0);
+            (prev > 0.0).then_some(prev)
+        });
+
+    let note = if date.is_empty() {
+        "最新净值".to_string()
+    } else {
+        format!("最新净值 {date}")
+    };
     Ok(Quote {
-        price,
+        price: nav,
         prev_close,
         name: None,
         note,
-        currency,
-        source: "sina",
+        currency: "CNY",
+        source: "eastmoney",
     })
 }
 
@@ -838,7 +1128,10 @@ pub fn stock_secids(raw: &str) -> Result<Vec<String>> {
     if symbol.chars().all(|c| c.is_ascii_digit()) {
         return match symbol.len() {
             6 => {
-                let market = if symbol.starts_with('6') || symbol.starts_with('9') {
+                // 92xxxx is BJ exchange; 6xxxxx and 900xxx (SH B share) use market 1.
+                let market = if symbol.starts_with('6')
+                    || (symbol.starts_with('9') && !symbol.starts_with("92"))
+                {
                     "1"
                 } else {
                     "0"
@@ -958,6 +1251,16 @@ fn json_text(value: Option<&Value>) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty() && *text != "--")
         .map(str::to_string)
+}
+
+// Extract the quoted payload of `var xxx="...";`.
+fn extract_quoted(body: &str) -> Option<&str> {
+    let start = body.find('"')? + 1;
+    let end = body.rfind('"')?;
+    if end < start {
+        return None;
+    }
+    Some(body[start..end].trim())
 }
 
 fn extract_jsonp(body: &str) -> Option<&str> {
@@ -1172,5 +1475,87 @@ mod tests {
         assert_eq!(items[3].symbol.as_deref(), Some("00700.HK"));
         assert_eq!(items[4].kind, "gold");
         assert_eq!(items[4].secid.as_deref(), Some("118.AU9999"));
+    }
+
+    #[test]
+    fn parses_tencent_quotes() {
+        let body = r#"v_sh601288="1~农业银行~601288~7.26~7.25~7.22~3194410";"#;
+        let quote = parse_tencent_quote("sh601288", body).unwrap();
+        assert!((quote.price - 7.26).abs() < 1e-9);
+        assert_eq!(quote.prev_close, Some(7.25));
+        assert_eq!(quote.name.as_deref(), Some("农业银行"));
+        assert_eq!(quote.currency, "CNY");
+
+        let body = r#"v_hk00700="100~腾讯控股~00700~398.200~409.600~404.000~18617972.0";"#;
+        let quote = parse_tencent_quote("hk00700", body).unwrap();
+        assert_eq!(quote.currency, "HKD");
+        assert!((quote.change_percent().unwrap() + 2.78).abs() < 0.01);
+
+        let body = r#"v_usAAPL="200~苹果~AAPL.OQ~355.63~348.51~349.55~34453477";"#;
+        let quote = parse_tencent_quote("usAAPL", body).unwrap();
+        assert_eq!(quote.currency, "USD");
+    }
+
+    #[test]
+    fn rejects_missing_tencent_symbol() {
+        assert!(parse_tencent_quote("sh999999", r#"v_pv_none_match="1";"#).is_err());
+    }
+
+    #[test]
+    fn parses_sina_a_share_and_gold() {
+        let body = r#"var hq_str_sh601288="农业银行,7.220,7.250,7.260,7.270,7.170,7.250,7.260,319440992,2310105525.000";"#;
+        let quote = parse_sina_quote("sh601288", body).unwrap();
+        assert!((quote.price - 7.26).abs() < 1e-9);
+        assert_eq!(quote.prev_close, Some(7.25));
+        assert_eq!(quote.name.as_deref(), Some("农业银行"));
+
+        let body = r#"var hq_str_gds_AU9999="851.33,0,851.00,851.33,871.40,850.02,15:29:50,872.98,869.00,525218,1.00,669.00,2026-11-12,沪金99";"#;
+        let quote = parse_sina_quote("gds_AU9999", body).unwrap();
+        assert!((quote.price - 851.33).abs() < 1e-9);
+        assert_eq!(quote.prev_close, Some(872.98));
+        assert_eq!(quote.name.as_deref(), Some("沪金99"));
+        assert_eq!(quote.currency, "CNY");
+    }
+
+    #[test]
+    fn parses_sina_fund_and_us() {
+        let body =
+            r#"var hq_str_f_161725="招商中证白酒指数A,0.5663,2.2824,0.585,2026-11-11,394.159";"#;
+        let quote = parse_sina_quote("f_161725", body).unwrap();
+        assert!((quote.price - 0.5663).abs() < 1e-9);
+        assert_eq!(quote.prev_close, Some(0.585));
+        assert!(quote.note.contains("2026-11-11"));
+
+        let body = r#"var hq_str_gb_aapl="苹果,355.6300,2.04,2026-11-12 09:16:15,7.1200,349.5450,355.9100,349.3250";"#;
+        let quote = parse_sina_quote("gb_aapl", body).unwrap();
+        assert_eq!(quote.currency, "USD");
+        assert!((quote.prev_close.unwrap() - 348.51).abs() < 1e-6);
+    }
+
+    #[test]
+    fn maps_fallback_symbols() {
+        let symbols = |secid: &str| {
+            fallback_symbols(secid)
+                .into_iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(symbols("1.601288"), vec!["sh601288", "sh601288"]);
+        assert_eq!(symbols("0.000001"), vec!["sz000001", "sz000001"]);
+        assert_eq!(symbols("0.920002"), vec!["bj920002", "bj920002"]);
+        assert_eq!(symbols("116.00700"), vec!["hk00700"]);
+        assert_eq!(symbols("105.AAPL"), vec!["usAAPL", "gb_aapl"]);
+        assert_eq!(symbols("118.AU9999"), vec!["gds_AU9999"]);
+        assert_eq!(symbols("113.aum"), vec!["nf_AU0"]);
+        assert!(symbols("114.AU9999").is_empty());
+    }
+
+    #[test]
+    fn parses_sina_futures_quote() {
+        let body = r#"var hq_str_nf_AU0="黄金连续,150000,869.400,870.120,851.480,852.500,852.360,852.580,852.500,860.460,870.500,1,2,129365.000,209762,沪,黄金,2026-11-12";"#;
+        let quote = parse_sina_quote("nf_AU0", body).unwrap();
+        assert!((quote.price - 852.5).abs() < 1e-9);
+        assert_eq!(quote.prev_close, Some(870.5));
+        assert_eq!(quote.name.as_deref(), Some("黄金连续"));
     }
 }

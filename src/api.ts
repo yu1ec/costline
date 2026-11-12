@@ -23,4 +23,12 @@ export const api = {
   resetState: () => invoke<Snapshot>("reset_state"),
   openConfigDir: () => invoke<void>("open_config_dir"),
   quit: () => invoke<void>("quit_app"),
+  /** 收起托盘下拉面板。 */
+  hideTrayPanel: () => invoke<void>("hide_tray_panel"),
+  /** 打开完整面板（可指定落在哪个 tab）。 */
+  openDashboard: (tab?: "dashboard" | "history" | "settings") =>
+    invoke<void>("open_dashboard", { tab: tab ?? null }),
+  /** 让下拉面板窗口高度贴合内容。 */
+  resizeTrayPanel: (height: number) =>
+    invoke<void>("resize_tray_panel", { height }),
 };
