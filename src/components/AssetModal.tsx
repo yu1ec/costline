@@ -1,15 +1,18 @@
 import { useEffect, useState } from "react";
-import { RefreshCw, Search } from "lucide-react";
-import type { AssetDraft } from "../drafts";
+import { Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import type { AssetDraft, TradeDraft } from "../drafts";
 import {
   ASSET_KINDS,
   WEEKDAY_LABELS,
   assetDerivedCost,
+  assetDerivedPosition,
   assetDerivedTarget,
   assetDraftError,
   assetPrimaryCode,
   kindLabel,
+  newTradeDraft,
   sipScheduleLabel,
+  skippedTradeCount,
 } from "../drafts";
 import { api } from "../api";
 import { formatPrice } from "../format";
@@ -140,8 +143,34 @@ export function AssetModal({
     }
   }
 
+  function addTrade() {
+    setDraft((current) => ({
+      ...current,
+      trades: [...current.trades, newTradeDraft()],
+    }));
+  }
+
+  function updateTrade(index: number, patch: Partial<TradeDraft>) {
+    setDraft((current) => ({
+      ...current,
+      trades: current.trades.map((trade, position) =>
+        position === index ? { ...trade, ...patch } : trade,
+      ),
+    }));
+  }
+
+  function removeTrade(index: number) {
+    setDraft((current) => ({
+      ...current,
+      trades: current.trades.filter((_, position) => position !== index),
+    }));
+  }
+
   const cost = assetDerivedCost(draft);
   const target = assetDerivedTarget(draft, globalThreshold);
+  const hasTrades = draft.trades.length > 0;
+  const position = assetDerivedPosition(draft);
+  const skipped = skippedTradeCount(draft);
   const codeLabel =
     draft.kind === "fund" ? "基金代码" : draft.kind === "gold" ? "黄金代码" : "股票代码";
   const codePlaceholder =
@@ -154,8 +183,9 @@ export function AssetModal({
   return (
     <Modal
       title={index == null ? "添加资产" : "编辑资产"}
-      subtitle="成本价或本金会自动换算成触发线，价格越过触发线时提醒。"
+      subtitle="成本价或本金会自动换算成触发线；成交记录会自动累加出最新成本价。"
       onClose={onClose}
+      wide={hasTrades}
       footer={
         <>
           <button type="button" className="btn ghost" onClick={onClose}>
@@ -279,14 +309,30 @@ export function AssetModal({
         </Field>
 
         <div className="form-grid two">
-          <Field label="成本价" hint="优先使用；留空则用本金 ÷ 数量">
+          <Field
+            label={hasTrades ? "期初成本价（可选）" : "成本价"}
+            hint={
+              hasTrades
+                ? "最终成本价由期初持仓 + 成交记录推导"
+                : "优先使用；留空则用本金 ÷ 数量"
+            }
+          >
             <NumberField
               value={draft.cost}
               placeholder="10.00"
               onChange={(value) => set("cost", value)}
             />
           </Field>
-          <Field label="持有数量" hint={draft.kind === "gold" ? "克数" : "股数 / 份额"}>
+          <Field
+            label={hasTrades ? "期初持有数量" : "持有数量"}
+            hint={
+              draft.kind === "gold"
+                ? "克数"
+                : draft.kind === "fund"
+                  ? "份额"
+                  : "股数"
+            }
+          >
             <NumberField
               value={draft.quantity}
               placeholder="1000"
@@ -295,13 +341,120 @@ export function AssetModal({
           </Field>
         </div>
 
-        <Field label="本金（可选）" hint="和持有数量一起填写时会自动计算成本价">
+        <Field
+          label={hasTrades ? "期初本金（可选）" : "本金（可选）"}
+          hint={
+            hasTrades
+              ? "期初持仓的买入金额；填了优先于期初成本价，留空则用成本价 × 数量"
+              : "和持有数量一起填写时会自动计算成本价"
+          }
+        >
           <NumberField
             value={draft.principal}
             placeholder="10000"
             onChange={(value) => set("principal", value)}
           />
         </Field>
+
+        {hasTrades ? (
+          <Field
+            label="期初持仓日期（可选）"
+            hint="上面的期初持仓视为这一天收盘后的状态；成交日期早于或等于它的记录不会重复计算"
+          >
+            <TextInput
+              type="date"
+              value={draft.asOf}
+              onChange={(event) => set("asOf", event.target.value)}
+            />
+          </Field>
+        ) : null}
+
+        <div className="trades-block">
+          <div className="trades-head">
+            <div>
+              <strong>成交记录</strong>
+              <em>
+                在期初持仓上按日期累加，买入增加本金，卖出从本金中扣除；成本价自动按「剩余本金 ÷
+                剩余数量」计算
+              </em>
+            </div>
+            <button type="button" className="btn mini" onClick={addTrade}>
+              <Plus size={13} /> 记一笔
+            </button>
+          </div>
+
+          {hasTrades ? (
+            <div className="trades-list">
+              <div className="trade-row trade-head">
+                <span>方向</span>
+                <span>数量</span>
+                <span>价格</span>
+                <span>手续费</span>
+                <span>日期</span>
+                <span />
+              </div>
+              {draft.trades.map((trade, index) => (
+                <div className="trade-row" key={index}>
+                  <Segmented
+                    value={trade.side}
+                    options={[
+                      { value: "buy", label: "买入" },
+                      { value: "sell", label: "卖出" },
+                    ]}
+                    onChange={(value) => updateTrade(index, { side: value })}
+                  />
+                  <NumberField
+                    value={trade.quantity}
+                    placeholder={draft.kind === "gold" ? "2" : "100"}
+                    onChange={(value) =>
+                      updateTrade(index, { quantity: value })
+                    }
+                  />
+                  <NumberField
+                    value={trade.price}
+                    placeholder="10.00"
+                    onChange={(value) => updateTrade(index, { price: value })}
+                  />
+                  <NumberField
+                    value={trade.fee}
+                    placeholder="0"
+                    onChange={(value) => updateTrade(index, { fee: value })}
+                  />
+                  <TextInput
+                    type="date"
+                    className="trade-date"
+                    value={trade.date}
+                    onChange={(event) =>
+                      updateTrade(index, { date: event.target.value })
+                    }
+                  />
+                  <button
+                    type="button"
+                    className="icon-btn danger"
+                    aria-label="删除这笔成交"
+                    onClick={() => removeTrade(index)}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="trades-empty">
+              还没有成交记录。买入、卖出都可以记在这里，不用再手动计算成本价。
+            </div>
+          )}
+
+          {skipped > 0 ? (
+            <div className="trades-warn">
+              有 {skipped} 笔成交的日期不晚于期初持仓日期，不会计入本次计算。
+            </div>
+          ) : null}
+
+          {position.error ? (
+            <div className="trades-warn error">{position.error}</div>
+          ) : null}
+        </div>
 
         <div className="form-grid two">
           <Field label="单独阈值 %（可选）" hint="覆盖全局阈值，0 表示回本即提醒">
@@ -401,8 +554,16 @@ export function AssetModal({
           ) : null}
         </div>
 
-        {cost != null || target != null ? (
+        {hasTrades || cost != null || target != null ? (
           <div className="derive-box">
+            {hasTrades ? (
+              <>
+                <span>数量</span>
+                <strong className="mono">{formatQuantity(position.quantity)}</strong>
+                <span>本金</span>
+                <strong className="mono">{formatPrice(position.principal)}</strong>
+              </>
+            ) : null}
             <span>成本价</span>
             <strong className="mono">{formatPrice(cost)}</strong>
             <span>触发价</span>
@@ -420,4 +581,10 @@ function errorMessage(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+/** 数量展示：最多 4 位小数，去掉末尾的 0，例如 6 / 1000.125 */
+function formatQuantity(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  return String(Number(value.toFixed(4)));
 }

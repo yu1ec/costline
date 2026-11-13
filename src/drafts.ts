@@ -6,6 +6,7 @@ import type {
   Config,
   SipFrequency,
   Trade,
+  TradeSide,
 } from "./types";
 
 export interface GlobalDraft {
@@ -18,6 +19,17 @@ export interface GlobalDraft {
   realtime: boolean;
 }
 
+/** 可编辑的成交记录：数字字段保留字符串，方便输入过程中清空或只输入一半。 */
+export interface TradeDraft {
+  id?: string | null;
+  note?: string | null;
+  side: TradeSide;
+  quantity: string;
+  price: string;
+  fee: string;
+  date: string;
+}
+
 export interface AssetDraft {
   kind: AssetKind;
   name: string;
@@ -28,7 +40,7 @@ export interface AssetDraft {
   quantity: string;
   principal: string;
   asOf: string;
-  trades: Trade[];
+  trades: TradeDraft[];
   threshold: string;
   target: string;
   sipEnabled: boolean;
@@ -121,6 +133,44 @@ function intOr(value: string, fallback: number): number {
   return parsed == null ? fallback : Math.trunc(parsed);
 }
 
+function tradeToDraft(trade: Trade): TradeDraft {
+  return {
+    id: trade.id ?? null,
+    note: trade.note ?? null,
+    side: trade.side,
+    quantity: numberText(trade.quantity),
+    price: numberText(trade.price),
+    fee: numberText(trade.fee),
+    date: text(trade.date),
+  };
+}
+
+function draftToTrade(draft: TradeDraft): Trade {
+  const trade: Trade = {
+    side: draft.side,
+    quantity: parseNumber(draft.quantity) ?? 0,
+    price: parseNumber(draft.price) ?? 0,
+  };
+  const fee = parseNumber(draft.fee);
+  if (fee != null) trade.fee = fee;
+  const date = draft.date.trim();
+  if (date) trade.date = date;
+  if (draft.id) trade.id = draft.id;
+  if (draft.note) trade.note = draft.note;
+  return trade;
+}
+
+function todayText(): string {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${month}-${day}`;
+}
+
+export function newTradeDraft(): TradeDraft {
+  return { side: "buy", quantity: "", price: "", fee: "", date: todayText() };
+}
+
 export function assetToDraft(asset: Asset): AssetDraft {
   return {
     kind: asset.kind,
@@ -132,7 +182,7 @@ export function assetToDraft(asset: Asset): AssetDraft {
     quantity: numberText(asset.quantity),
     principal: numberText(asset.principal),
     asOf: text(asset.as_of),
-    trades: asset.trades ?? [],
+    trades: (asset.trades ?? []).map(tradeToDraft),
     threshold: numberText(asset.threshold_percent),
     target: numberText(asset.target_price),
     sipEnabled: asset.sip?.enabled ?? false,
@@ -189,7 +239,7 @@ export function draftToAsset(draft: AssetDraft): Asset {
   if (principal != null) asset.principal = principal;
   const asOf = draft.asOf.trim();
   if (asOf) asset.as_of = asOf;
-  if (draft.trades.length > 0) asset.trades = draft.trades;
+  if (draft.trades.length > 0) asset.trades = draft.trades.map(draftToTrade);
   const threshold = parseNumber(draft.threshold);
   if (threshold != null) asset.threshold_percent = threshold;
   const target = parseNumber(draft.target);
@@ -223,12 +273,46 @@ export function assetDraftError(draft: AssetDraft): string | null {
   const principal = parseNumber(draft.principal);
   const target = parseNumber(draft.target);
 
-  if (cost == null && target == null && !(principal != null && quantity != null)) {
-    return "请填写成本价，或者同时填写本金与持有数量";
+  // 有成交记录时，持仓与成本价可以由流水推导，期初持仓可以留空。
+  if (draft.trades.length === 0) {
+    if (
+      cost == null &&
+      target == null &&
+      !(principal != null && quantity != null)
+    ) {
+      return "请填写成本价，或者同时填写本金与持有数量";
+    }
+    if (cost == null && principal != null && quantity == null) {
+      return "填写了本金，还需要填写持有数量才能算出成本价";
+    }
   }
-  if (cost == null && principal != null && quantity == null) {
-    return "填写了本金，还需要填写持有数量才能算出成本价";
+
+  const asOf = draft.asOf.trim();
+  if (asOf && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
+    return "期初持仓日期格式应为 YYYY-MM-DD";
   }
+
+  for (const [index, trade] of draft.trades.entries()) {
+    const tradeQuantity = parseNumber(trade.quantity);
+    const tradePrice = parseNumber(trade.price);
+    const fee = parseNumber(trade.fee);
+    if (tradeQuantity == null || tradeQuantity <= 0) {
+      return `第 ${index + 1} 笔成交数量必须大于 0`;
+    }
+    if (tradePrice == null || tradePrice <= 0) {
+      return `第 ${index + 1} 笔成交价格必须大于 0`;
+    }
+    if (fee != null && fee < 0) {
+      return `第 ${index + 1} 笔手续费不能为负数`;
+    }
+    const date = trade.date.trim();
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return `第 ${index + 1} 笔成交日期格式应为 YYYY-MM-DD`;
+    }
+  }
+
+  const position = assetDerivedPosition(draft);
+  if (position.error) return position.error;
 
   const fields: [string, string, boolean][] = [
     ["成本价", draft.cost, true],
@@ -303,7 +387,114 @@ export function assetPrimaryCode(draft: AssetDraft): string {
   return draft.symbol.trim() || draft.secid.trim() || draft.code.trim();
 }
 
+const POSITION_EPSILON = 1e-9;
+
+export interface PositionPreview {
+  quantity: number;
+  principal: number;
+  cost: number | null;
+  hasPosition: boolean;
+  recovered: boolean;
+  closed: boolean;
+  /** 成交流水无法推导时的错误，例如卖出超过持有数量 */
+  error: string | null;
+}
+
+/**
+ * 前端版的 Position::derive：期初持仓 + 成交流水。
+ * 规则与 crates/costline-core/src/position.rs 保持一致：
+ * 买入累加数量与本金，卖出净额从本金中扣除，成本价 = 剩余本金 ÷ 剩余数量。
+ */
+export function assetDerivedPosition(draft: AssetDraft): PositionPreview {
+  const quantity = parseNumber(draft.quantity);
+  const cost = parseNumber(draft.cost);
+  const principal = parseNumber(draft.principal);
+
+  let positionQuantity = quantity ?? 0;
+  let positionPrincipal =
+    principal ?? (cost != null ? cost * (quantity ?? 0) : 0);
+  const hasPosition =
+    quantity != null || principal != null || draft.trades.length > 0;
+
+  const asOf = draft.asOf.trim();
+  const ordered = draft.trades
+    .map((trade, index) => ({ trade, index }))
+    // 期初持仓已经包含 as_of 当天及以前的成交，不重复应用。
+    .filter(({ trade }) => {
+      const date = trade.date.trim();
+      return !date || !asOf || date > asOf;
+    })
+    .sort((left, right) => {
+      const leftDate = left.trade.date.trim();
+      const rightDate = right.trade.date.trim();
+      if (leftDate === rightDate) return left.index - right.index;
+      return leftDate < rightDate ? -1 : 1;
+    })
+    .map(({ trade }) => trade);
+
+  let error: string | null = null;
+  for (const trade of ordered) {
+    const tradeQuantity = parseNumber(trade.quantity);
+    const tradePrice = parseNumber(trade.price);
+    const fee = parseNumber(trade.fee) ?? 0;
+    if (tradeQuantity == null || tradeQuantity <= 0) {
+      error = "成交数量必须大于 0";
+      break;
+    }
+    if (tradePrice == null || tradePrice <= 0) {
+      error = "成交价格必须大于 0";
+      break;
+    }
+    if (!Number.isFinite(fee) || fee < 0) {
+      error = "手续费不能为负数";
+      break;
+    }
+
+    if (trade.side === "buy") {
+      positionQuantity += tradeQuantity;
+      positionPrincipal += tradeQuantity * tradePrice + fee;
+    } else {
+      if (tradeQuantity > positionQuantity + POSITION_EPSILON) {
+        error = `卖出 ${trimNumber(tradeQuantity)} 超过持有数量 ${trimNumber(positionQuantity)}`;
+        break;
+      }
+      positionQuantity = Math.max(0, positionQuantity - tradeQuantity);
+      positionPrincipal -= tradeQuantity * tradePrice - fee;
+    }
+  }
+
+  if (Math.abs(positionPrincipal) < POSITION_EPSILON) positionPrincipal = 0;
+  const closed = hasPosition && positionQuantity <= POSITION_EPSILON;
+  const recovered = hasPosition && !closed && positionPrincipal <= 0;
+  return {
+    quantity: positionQuantity,
+    principal: positionPrincipal,
+    cost:
+      positionQuantity > POSITION_EPSILON
+        ? positionPrincipal / positionQuantity
+        : null,
+    hasPosition,
+    recovered,
+    closed,
+    error,
+  };
+}
+
+/** 成交日期不晚于期初持仓日期、因此不会计入的笔数。 */
+export function skippedTradeCount(draft: AssetDraft): number {
+  const asOf = draft.asOf.trim();
+  if (!asOf) return 0;
+  return draft.trades.filter((trade) => {
+    const date = trade.date.trim();
+    return Boolean(date) && date <= asOf;
+  }).length;
+}
+
 export function assetDerivedCost(draft: AssetDraft): number | null {
+  // 有成交流水时，成本价由流水推导；否则沿用 cost / 本金 ÷ 数量。
+  if (draft.trades.length > 0) {
+    return assetDerivedPosition(draft).cost;
+  }
   const cost = parseNumber(draft.cost);
   if (cost != null) return cost;
   const principal = parseNumber(draft.principal);
@@ -320,10 +511,23 @@ export function assetDerivedTarget(
 ): number | null {
   const target = parseNumber(draft.target);
   if (target != null) return target;
+  if (draft.trades.length > 0) {
+    // 本金已收回或已清仓时不再做回本提醒，和 Rust 侧保持一致。
+    const position = assetDerivedPosition(draft);
+    if (position.recovered || position.closed || position.cost == null) {
+      return null;
+    }
+    const threshold = parseNumber(draft.threshold);
+    return position.cost * (1 + (threshold ?? globalThreshold) / 100);
+  }
   const cost = assetDerivedCost(draft);
   if (cost == null) return null;
   const threshold = parseNumber(draft.threshold);
   return cost * (1 + (threshold ?? globalThreshold) / 100);
+}
+
+function trimNumber(value: number): string {
+  return String(Number(value.toFixed(6)));
 }
 
 export function emptyChannelDraft(type: ChannelType): ChannelDraft {

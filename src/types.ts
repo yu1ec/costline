@@ -111,6 +111,10 @@ export interface Config {
 
 export interface GoldReference {
   price: number;
+  /** 实时买入价（买一），数据源不提供时为 null */
+  buy_price: number | null;
+  /** 实时卖出价（卖一），数据源不提供时为 null */
+  sell_price: number | null;
   change_percent: number | null;
   note: string;
 }

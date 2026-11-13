@@ -627,7 +627,7 @@ pub fn build_notice(alerts: &[Row]) -> Notice {
         if let Some(gold) = &row.gold_price {
             lines.push(format!(
                 "国内金价 {} 元/克{}",
-                fmt_price(gold.price),
+                gold_price_text(gold),
                 gold.change_percent
                     .map(|change| format!("（{}）", fmt_percent(Some(change))))
                     .unwrap_or_default()
@@ -742,6 +742,16 @@ pub fn build_sip_notice(reminders: &[SipReminder]) -> Notice {
     Notice {
         title,
         body: lines.join("\n"),
+    }
+}
+
+/// 国内金价的展示文案：有买卖价时显示「买入 x · 卖出 y」，否则退回最新价。
+pub fn gold_price_text(gold: &market::GoldReference) -> String {
+    match (gold.buy_price, gold.sell_price) {
+        (Some(buy), Some(sell)) => {
+            format!("买入 {} · 卖出 {}", fmt_price(buy), fmt_price(sell))
+        }
+        _ => fmt_price(gold.price),
     }
 }
 

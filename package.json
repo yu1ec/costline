@@ -1,7 +1,7 @@
 {
   "name": "costline",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "股票 / 基金 / 黄金 回本盯盘托盘工具",
   "license": "MIT",

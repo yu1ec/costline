@@ -204,6 +204,10 @@ fn stock_search_symbol(code: &str, quote_id: Option<&str>) -> String {
 pub struct Quote {
     pub price: f64,
     pub prev_close: Option<f64>,
+    /// 买一价（买入价），只有部分品种（如上海金）提供
+    pub bid_price: Option<f64>,
+    /// 卖一价（卖出价），只有部分品种（如上海金）提供
+    pub ask_price: Option<f64>,
     pub name: Option<String>,
     /// 数据说明，例如“估值 2026-11-03 15:00”
     pub note: String,
@@ -234,6 +238,10 @@ pub const DOMESTIC_GOLD_SECID: &str = "118.AU9999";
 #[derive(Debug, Clone, Serialize)]
 pub struct GoldReference {
     pub price: f64,
+    /// 实时买入价（买一），部分数据源不提供时为 None
+    pub buy_price: Option<f64>,
+    /// 实时卖出价（卖一），部分数据源不提供时为 None
+    pub sell_price: Option<f64>,
     pub change_percent: Option<f64>,
     /// 例如「上海金 Au99.99（元/克）」
     pub note: String,
@@ -258,13 +266,16 @@ fn mentions_gold(text: &str) -> bool {
 }
 
 /// 获取国内金价（上海金 Au99.99，元/克）。
+///
+/// 新浪上海金行情同时提供买入价 / 卖出价，优先使用；东方财富的 118.AU9999
+/// 只有最新价，作为新浪失败时的兜底。
 pub async fn fetch_domestic_gold(client: &Client) -> Result<GoldReference> {
     let mut errors = Vec::new();
-    match fetch_eastmoney(client, DOMESTIC_GOLD_SECID).await {
+    match fetch_sina(client, "gds_AU9999").await {
         Ok(quote) => return Ok(domestic_gold_reference(&quote)),
         Err(error) => errors.push(format!("{error:#}")),
     }
-    match fetch_sina(client, "gds_AU9999").await {
+    match fetch_eastmoney(client, DOMESTIC_GOLD_SECID).await {
         Ok(quote) => return Ok(domestic_gold_reference(&quote)),
         Err(error) => errors.push(format!("{error:#}")),
     }
@@ -274,6 +285,8 @@ pub async fn fetch_domestic_gold(client: &Client) -> Result<GoldReference> {
 fn domestic_gold_reference(quote: &Quote) -> GoldReference {
     GoldReference {
         price: quote.price,
+        buy_price: quote.bid_price,
+        sell_price: quote.ask_price,
         change_percent: quote.change_percent(),
         note: "上海金 Au99.99（元/克）".to_string(),
     }
@@ -481,6 +494,8 @@ async fn fetch_eastmoney(client: &Client, secid: &str) -> Result<Quote> {
     Ok(Quote {
         price,
         prev_close,
+        bid_price: None,
+        ask_price: None,
         name,
         note: "东方财富实时".to_string(),
         currency: currency_of_secid(secid),
@@ -527,6 +542,8 @@ async fn fetch_fundgz(client: &Client, code: &str) -> Result<Quote> {
     Ok(Quote {
         price,
         prev_close,
+        bid_price: None,
+        ask_price: None,
         name,
         note,
         currency: "CNY",
@@ -566,6 +583,8 @@ async fn fetch_danjuan(client: &Client, code: &str) -> Result<Quote> {
         Ok((nav, prev_close, date)) => Ok(Quote {
             price: nav,
             prev_close,
+            bid_price: None,
+            ask_price: None,
             name,
             note: format!("最新净值 {date}"),
             currency: "CNY",
@@ -586,6 +605,8 @@ async fn fetch_danjuan(client: &Client, code: &str) -> Result<Quote> {
                     return Ok(Quote {
                         price: nav,
                         prev_close: None,
+                        bid_price: None,
+                        ask_price: None,
                         name,
                         note,
                         currency: "CNY",
@@ -861,6 +882,8 @@ fn parse_tencent_quote(symbol: &str, body: &str) -> Result<Quote> {
     Ok(Quote {
         price,
         prev_close,
+        bid_price: None,
+        ask_price: None,
         name: (!name.is_empty()).then(|| name.to_string()),
         note: "腾讯行情".to_string(),
         currency: currency_of_symbol(symbol),
@@ -917,6 +940,8 @@ fn parse_sina_quote(symbol: &str, body: &str) -> Result<Quote> {
         return Ok(Quote {
             price,
             prev_close: number(3),
+            bid_price: None,
+            ask_price: None,
             name: text(0),
             note,
             currency: "CNY",
@@ -930,6 +955,8 @@ fn parse_sina_quote(symbol: &str, body: &str) -> Result<Quote> {
         return Ok(Quote {
             price,
             prev_close: number(10).or_else(|| number(5)),
+            bid_price: None,
+            ask_price: None,
             name: text(0),
             note: "新浪期货行情".to_string(),
             currency: "CNY",
@@ -953,6 +980,9 @@ fn parse_sina_quote(symbol: &str, body: &str) -> Result<Quote> {
         return Ok(Quote {
             price,
             prev_close: number(7),
+            // 上海金 / 国际金价：第 3 个字段为买入价，第 4 个字段为卖出价。
+            bid_price: number(2),
+            ask_price: number(3),
             name: text(13),
             note,
             currency,
@@ -972,6 +1002,8 @@ fn parse_sina_quote(symbol: &str, body: &str) -> Result<Quote> {
         return Ok(Quote {
             price,
             prev_close,
+            bid_price: None,
+            ask_price: None,
             name: text(0),
             note: "新浪美股行情".to_string(),
             currency: "USD",
@@ -984,6 +1016,8 @@ fn parse_sina_quote(symbol: &str, body: &str) -> Result<Quote> {
     Ok(Quote {
         price,
         prev_close: number(2),
+        bid_price: None,
+        ask_price: None,
         name: text(0),
         note: "新浪行情".to_string(),
         currency: "CNY",
@@ -1064,6 +1098,8 @@ async fn fetch_fund_lsjz(client: &Client, code: &str) -> Result<Quote> {
     Ok(Quote {
         price: nav,
         prev_close,
+        bid_price: None,
+        ask_price: None,
         name: None,
         note,
         currency: "CNY",
@@ -1513,8 +1549,15 @@ mod tests {
         let quote = parse_sina_quote("gds_AU9999", body).unwrap();
         assert!((quote.price - 851.33).abs() < 1e-9);
         assert_eq!(quote.prev_close, Some(872.98));
+        assert_eq!(quote.bid_price, Some(851.0));
+        assert_eq!(quote.ask_price, Some(851.33));
         assert_eq!(quote.name.as_deref(), Some("沪金99"));
         assert_eq!(quote.currency, "CNY");
+
+        let reference = domestic_gold_reference(&quote);
+        assert_eq!(reference.buy_price, Some(851.0));
+        assert_eq!(reference.sell_price, Some(851.33));
+        assert_eq!(reference.price, 851.33);
     }
 
     #[test]

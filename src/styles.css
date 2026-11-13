@@ -932,6 +932,7 @@ button {
 
 .derive-box {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 9px;
   padding: 10px 13px;
@@ -947,6 +948,107 @@ button {
 
 .derive-box strong {
   font-size: 13px;
+}
+
+/* ---------- trades ---------- */
+
+.trades-block {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 12px 13px;
+  border-radius: 12px;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-2);
+}
+
+.trades-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trades-head > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.trades-head strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.trades-head em {
+  color: var(--dim);
+  font-style: normal;
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.trades-empty {
+  padding: 12px;
+  border-radius: 9px;
+  border: 1px dashed var(--border);
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.trades-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.trade-row {
+  display: grid;
+  grid-template-columns:
+    104px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) 118px 30px;
+  align-items: center;
+  gap: 8px;
+}
+
+.trade-row .segmented {
+  width: 100%;
+  height: 37px;
+}
+
+.trade-row .segment {
+  flex: 1;
+  height: 29px;
+  padding: 0 6px;
+}
+
+.trade-row .input {
+  height: 37px;
+  font-size: 12.5px;
+}
+
+.trade-head {
+  padding: 0 2px;
+}
+
+.trade-head span {
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
+.trade-date {
+  padding-right: 6px;
+  font-size: 11.5px;
+}
+
+.trades-warn {
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+.trades-warn.error {
+  color: var(--danger);
 }
 
 /* ---------- sip ---------- */
@@ -4014,6 +4116,15 @@ html[data-window="tray"] #root {
 
 html[data-window="tray"] body {
   user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 拖动托盘条目的过程中，整页禁止选中文字。 */
+html.row-dragging,
+html.row-dragging * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  cursor: grabbing !important;
 }
 
 html[data-window="tray"] #root {
@@ -4034,7 +4145,14 @@ html[data-window="tray"] #root {
 }
 
 .tray-panel::-webkit-scrollbar {
-  width: 0;
+  width: 6px;
+}
+
+.tray-panel::-webkit-scrollbar-thumb {
+  border: 1px solid transparent;
+  border-radius: 99px;
+  background: var(--scroll-thumb);
+  background-clip: padding-box;
 }
 
 .tray-head {
@@ -4202,6 +4320,60 @@ html[data-window="tray"] #root {
   color: var(--accent);
 }
 
+.tray-block-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tray-rows-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 1px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-3);
+}
+
+.tray-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.tray-step:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.tray-step:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.tray-rows-count {
+  min-width: 14px;
+  color: var(--text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.tray-order-reset {
+  width: 18px;
+  height: 18px;
+  color: var(--muted);
+}
+
 .tray-empty {
   padding: 14px 0 8px;
   color: var(--dim);
@@ -4209,9 +4381,144 @@ html[data-window="tray"] #root {
   text-align: center;
 }
 
+/* 条目超过固定高度时列表内部滚动，面板本身不再继续变高。 */
+.tray-rows {
+  max-height: 264px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.tray-rows::-webkit-scrollbar {
+  width: 6px;
+}
+
+.tray-rows::-webkit-scrollbar-thumb {
+  border: 1px solid transparent;
+  border-radius: 99px;
+  background: var(--scroll-thumb);
+  background-clip: padding-box;
+}
+
 .tray-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   padding: 6px 2px;
   border-bottom: 1px dashed var(--border-soft);
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+/* 拖动中的行被拎出列表：脱离文档流跟随指针，加底和投影，看起来是「拽出来」。 */
+.tray-row.dragging {
+  z-index: 50;
+  opacity: 1;
+  cursor: grabbing;
+  border-bottom-color: transparent;
+  border-radius: 10px;
+  background: var(--panel-2);
+  box-shadow:
+    0 14px 30px -10px rgba(0, 0, 0, 0.5),
+    0 3px 8px -2px rgba(0, 0, 0, 0.25),
+    0 0 0 1px color-mix(in srgb, var(--accent) 40%, var(--border));
+  will-change: transform;
+}
+
+.tray-row.dragging .tray-row-move {
+  visibility: hidden;
+}
+
+/* 被拖走那一行留下的空位。 */
+.tray-row-gap {
+  pointer-events: none;
+}
+
+/* 其余行让位时平滑滑动，给被拖的行腾出插入槽位。 */
+.tray-rows.is-dragging .tray-row:not(.dragging) {
+  transition: transform 170ms cubic-bezier(0.22, 0.8, 0.2, 1);
+}
+
+/* 松手落位：落点闪一下强调色，像是被塞进槽位。 */
+@keyframes tray-row-settle {
+  0% {
+    background-color: color-mix(in srgb, var(--accent) 16%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.tray-row.dropped {
+  animation: tray-row-settle 240ms cubic-bezier(0.22, 0.8, 0.2, 1);
+}
+
+.tray-row.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.tray-row.drop-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+/* 上下移动按钮：不依赖拖动事件，鼠标移到行上即可点击。 */
+.tray-row-move {
+  display: inline-flex;
+  flex: none;
+  flex-direction: column;
+  gap: 0;
+}
+
+.tray-move {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 11px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: var(--dim);
+  opacity: 0.45;
+  cursor: pointer;
+}
+
+.tray-row:hover .tray-move {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.tray-move:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.tray-move:disabled,
+.tray-row:hover .tray-move:disabled {
+  cursor: default;
+  opacity: 0.15;
+}
+
+.tray-row-grip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  color: var(--dim);
+  opacity: 0.45;
+}
+
+.tray-row:hover .tray-row-grip {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.tray-row-body {
+  flex: 1;
+  min-width: 0;
 }
 
 .tray-row:last-child {

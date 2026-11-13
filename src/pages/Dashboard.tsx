@@ -211,9 +211,24 @@ export function Dashboard({
                   {row.gold_price ? (
                     <span className="asset-gold" title={row.gold_price.note}>
                       国内金价{" "}
-                      <span className="mono">
-                        {formatPrice(row.gold_price.price)}
-                      </span>{" "}
+                      {row.gold_price.buy_price != null &&
+                      row.gold_price.sell_price != null ? (
+                        <>
+                          买入{" "}
+                          <span className="mono">
+                            {formatPrice(row.gold_price.buy_price)}
+                          </span>
+                          {" · "}
+                          卖出{" "}
+                          <span className="mono">
+                            {formatPrice(row.gold_price.sell_price)}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="mono">
+                          {formatPrice(row.gold_price.price)}
+                        </span>
+                      )}{" "}
                       元/克
                       {row.gold_price.change_percent != null
                         ? ` · ${formatPercent(row.gold_price.change_percent)}`

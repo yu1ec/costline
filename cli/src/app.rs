@@ -234,7 +234,7 @@ fn print_table(rows: &[Row]) {
         if let Some(gold) = &row.gold_price {
             println!(
                 "    ↳ 国内金价 {} 元/克{}",
-                monitor::fmt_price(gold.price),
+                monitor::gold_price_text(gold),
                 gold.change_percent
                     .map(|change| format!("（{}）", monitor::fmt_percent(Some(change))))
                     .unwrap_or_default()
